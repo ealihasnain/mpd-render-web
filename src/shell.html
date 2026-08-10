@@ -1,0 +1,128 @@
+<!doctype html>
+<!-- @mpd-version render-web 1 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mpd-render-web</title>
+<style>
+  :root{--canvas:#E4DDD0;--raise:#EFE9DE;--ink:#2A2520;--soft:#5A5048;--faint:#8A8074;
+        --teal:#2DB89D;--amber:#F5C518;--red:#E63946;--slate:#8BA8B5;}
+  *{box-sizing:border-box}
+  body{margin:0;background:#151310;color:#EDE7DB;
+       font:400 14px/1.55 Barlow,system-ui,-apple-system,sans-serif}
+  header{padding:16px 20px 10px;border-bottom:1px solid rgba(237,231,219,.14)}
+  h1{font:900 22px/1 "Barlow Condensed",Barlow,sans-serif;text-transform:uppercase;
+     letter-spacing:.04em;margin:0 0 3px}
+  .sub{font:400 11px/1.4 ui-monospace,"DM Mono",monospace;color:var(--slate)}
+  main{display:grid;grid-template-columns:minmax(340px,400px) 1fr;gap:0;height:calc(100vh - 64px)}
+  @media(max-width:860px){main{grid-template-columns:1fr;height:auto}}
+  #side{padding:16px 20px;overflow:auto;border-right:1px solid rgba(237,231,219,.14)}
+  #right{padding:16px 20px;overflow:auto;display:flex;flex-direction:column;gap:12px}
+  fieldset{border:1px solid rgba(237,231,219,.16);border-radius:10px;padding:12px 14px;margin:0 0 14px}
+  legend{font:700 11px/1 Barlow,sans-serif;text-transform:uppercase;letter-spacing:.09em;
+         color:var(--teal);padding:0 6px}
+  label{display:block;font-size:12px;font-weight:700;margin:9px 0 3px}
+  input[type=file]{width:100%;font-size:12px;color:var(--slate)}
+  select,input[type=number]{font:400 13px Barlow,sans-serif;padding:6px 9px;border-radius:8px;
+    border:1px solid rgba(237,231,219,.22);background:#2B2721;color:#EDE7DB;width:100%}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+  .chk{display:flex;gap:8px;align-items:flex-start;margin:9px 0;font-weight:400;font-size:12.5px}
+  .chk input{margin-top:3px;accent-color:var(--teal);flex:none}
+  .chk span small{display:block;color:var(--faint);font-size:11px;line-height:1.4}
+  .btn{font:700 13px Barlow,sans-serif;cursor:pointer;background:#2B2721;color:#EDE7DB;
+       border:1px solid rgba(237,231,219,.22);border-radius:999px;padding:9px 16px;margin:4px 4px 0 0}
+  .btn:hover:not(:disabled){background:#3A342C}
+  .btn.pri{background:var(--teal);color:#10221E;border-color:var(--teal)}
+  .btn.warn{background:var(--amber);color:#2A2520;border-color:var(--amber)}
+  .btn:disabled{opacity:.38;cursor:default}
+  #stagewrap{background:#000;border:1px solid rgba(237,231,219,.14);border-radius:10px;
+             overflow:hidden;aspect-ratio:16/9;flex:none}
+  #stage{width:100%;height:100%;border:0;display:block}
+  #pbar{height:7px;border-radius:4px;background:rgba(237,231,219,.14);overflow:hidden}
+  #pfill{height:100%;width:0;background:var(--teal);transition:width .15s linear}
+  #ptext{font:400 11.5px ui-monospace,"DM Mono",monospace;color:var(--slate);margin-top:5px}
+  #log{font:400 11.5px/1.65 ui-monospace,"DM Mono",monospace;background:#0E0C0A;
+       border:1px solid rgba(237,231,219,.12);border-radius:10px;padding:11px 13px;
+       flex:1;min-height:170px;overflow:auto;white-space:pre-wrap;color:#C9BFB0}
+  #log .ok{color:var(--teal)} #log .err{color:#FF8A93} #log .warn{color:var(--amber)}
+  .note{font-size:11.5px;color:var(--faint);line-height:1.5;margin-top:8px}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>mpd-render-web</h1>
+  <div class="sub">deterministic master render · WebCodecs · no upload, nothing leaves this machine</div>
+</header>
+
+<main>
+  <div id="side">
+    <fieldset>
+      <legend>Input</legend>
+      <label>Episode video HTML</label>
+      <input type="file" id="fHtml" accept=".html,text/html">
+      <label>Voice mix (optional)</label>
+      <input type="file" id="fAudio" accept="audio/*">
+      <div class="note">The timeline, chapters and beats are read from the HTML.
+        No episode.json needed.</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Output</legend>
+      <div class="two">
+        <div><label>Container</label>
+          <select id="fmtsel">
+            <option value="auto" selected>Auto</option>
+            <option value="mp4">MP4 · H.264 + AAC</option>
+            <option value="webm">WebM · VP9 + Opus</option>
+          </select></div>
+        <div><label>FPS</label>
+          <select id="fps"><option>24</option><option selected>30</option><option>60</option></select></div>
+      </div>
+      <div class="two" style="margin-top:9px">
+        <div><label>Bitrate</label>
+          <select id="br">
+            <option value="12000000">12 Mbps</option>
+            <option value="16000000" selected>16 Mbps</option>
+            <option value="24000000">24 Mbps</option>
+          </select></div>
+        <div><label>Volume %</label><input type="number" id="vol" min="0" max="100" value="100"></div>
+      </div>
+      <label class="chk"><input type="checkbox" id="pfade" checked>
+        <span>Picture fade at chapters<small>Matches the preview dip. The old MediaRecorder export never applied it.</small></span></label>
+      <label class="chk"><input type="checkbox" id="afade" checked>
+        <span>Audio duck at chapters<small>Same curve as the picture fade — replaces the ffmpeg -af string.</small></span></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Contact sheets</legend>
+      <div class="two">
+        <div><label>Shoot at % of beat</label><input type="number" id="fillat" min="1" max="100" value="85"></div>
+        <div><label>Columns</label><input type="number" id="cols" min="2" max="8" value="4"></div>
+      </div>
+    </fieldset>
+
+    <button class="btn" id="bInspect" disabled>Inspect</button>
+    <button class="btn warn" id="bSheets" disabled>Contact sheets</button>
+    <button class="btn pri" id="bRender" disabled>Render master</button>
+    <button class="btn" id="bCancel" disabled>Cancel</button>
+    <div class="note">Keep this tab focused and the machine awake. A background
+      tab is throttled and the render will crawl.</div>
+  </div>
+
+  <div id="right">
+    <div id="stagewrap"><iframe id="stage"></iframe></div>
+    <div>
+      <div id="pbar"><div id="pfill"></div></div>
+      <div id="ptext">Idle</div>
+    </div>
+    <div id="log"></div>
+  </div>
+</main>
+
+<script>/*__MP4MUXER__*/</script>
+<script>/*__WEBMMUXER__*/</script>
+<script>/*__APP__*/</script>
+</body>
+</html>
