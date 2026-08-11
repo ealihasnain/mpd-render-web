@@ -1,4 +1,4 @@
-# mpd-render-web 2
+# mpd-render-web 3
 
 Deterministic master render for MoneyPatternsDecoded video shells. Runs entirely
 in the browser — no Python, no admin rights, no install, nothing uploaded.
@@ -21,6 +21,37 @@ The rasteriser calls the shell's own `serializeFrame()`, so the pixels are the
 ones the shell would have produced. Verified byte-identical to the shell's
 `rasterFrame()` at six sample points across a real episode: zero differing
 pixels, max channel difference 0.
+
+## What version 3 fixes
+
+Version 2 rendered EP002 in 30.1 minutes after projecting 2:39. Both numbers
+were honest and the gap between them was the whole problem: the projection was
+built on the rasteriser (9ms/frame, measured) while the run was governed by the
+encoder (106ms/frame, observed). 17,073 frames in 30.1 minutes is 9.4fps, which
+is what Chrome's *software* H.264 encoder does at 1080p. `configure()` never
+named an acceleration preference, so the browser picked, and it picked software
+while the machine's hardware encoder sat idle.
+
+There is no clean way to ask whether a hardware encoder is really in play.
+`hardwareAcceleration` is a hint the browser may decline, and
+`'require-hardware'` is not a value the spec defines. So version 3 measures:
+
+- **Encoder benchmark.** Eight configurations — MP4 and WebM, each at
+  hardware / hardware-realtime / software-realtime / browser-default — each run
+  through 48 real frames from your episode. Observed fps and projected episode
+  runtime are reported for every one *before* the master starts. Inspect runs
+  this automatically; the **Encoder** dropdown pins a specific one.
+- **Honest projection.** Rasterising and encoding overlap, so the estimate is
+  now `max(raster, encode)` rather than the rasteriser alone, and the log says
+  which of the two is governing.
+- **Deeper queue.** The old 8/4 backpressure pair meant a fast encoder spent
+  its time waiting on a 4ms poll. Now 30/15, and the progress line reports the
+  share of elapsed time spent waiting on the encoder, so a stall is visible
+  while it happens rather than afterwards.
+
+Expect single-digit minutes where a hardware encoder exists. Where none does,
+software VP9 in `realtime` mode multithreads and generally beats OpenH264 — the
+benchmark will find it.
 
 ## Requirements
 

@@ -1,59 +1,105 @@
 <!doctype html>
-<!-- @mpd-version render-web 2 -->
+<!-- @mpd-version render-web 3 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>mpd-render-web</title>
+<title>MPD Render Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;700;900&family=Barlow:wght@400;500;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-  :root{--canvas:#E4DDD0;--raise:#EFE9DE;--ink:#2A2520;--soft:#5A5048;--faint:#8A8074;
-        --teal:#2DB89D;--amber:#F5C518;--red:#E63946;--slate:#8BA8B5;}
+  /* Brand tokens — identical to MPD Studio. No colour outside this block. */
+  :root{
+    --canvas:#E4DDD0;
+    --canvas-lift:#EFE9DD;
+    --canvas-deep:#D8D0C1;
+    --ink:#2A2520;
+    --ink-soft:#5A5046;
+    --teal:#2DB89D;
+    --teal-deep:#1F8D77;
+    --amber:#F5C518;
+    --red:#E63946;
+    --slate:#8BA8B5;
+    --slate-deep:#5C7884;
+    --hairline:#2A252022;
+
+    --font-display:'Barlow Condensed',sans-serif;
+    --font-body:'Barlow',sans-serif;
+    --font-mono:'DM Mono',ui-monospace,monospace;
+  }
   *{box-sizing:border-box}
-  body{margin:0;background:#151310;color:#EDE7DB;
-       font:400 14px/1.55 Barlow,system-ui,-apple-system,sans-serif}
-  header{padding:16px 20px 10px;border-bottom:1px solid rgba(237,231,219,.14)}
-  h1{font:900 22px/1 "Barlow Condensed",Barlow,sans-serif;text-transform:uppercase;
-     letter-spacing:.04em;margin:0 0 3px}
-  .sub{font:400 11px/1.4 ui-monospace,"DM Mono",monospace;color:var(--slate)}
-  main{display:grid;grid-template-columns:minmax(340px,400px) 1fr;gap:0;height:calc(100vh - 64px)}
+  body{margin:0;background:var(--canvas);color:var(--ink);
+       font:400 14px/1.55 var(--font-body)}
+
+  header{padding:18px 22px 14px;border-bottom:2px solid var(--ink);background:var(--canvas-lift)}
+  h1{font-family:var(--font-display);font-weight:900;font-size:26px;line-height:1;
+     text-transform:uppercase;letter-spacing:-0.005em;margin:0 0 4px}
+  .sub{font-family:var(--font-mono);font-size:11px;letter-spacing:0.08em;
+       text-transform:uppercase;color:var(--ink-soft)}
+
+  main{display:grid;grid-template-columns:minmax(340px,410px) 1fr;gap:0;height:calc(100vh - 74px)}
   @media(max-width:860px){main{grid-template-columns:1fr;height:auto}}
-  #side{padding:16px 20px;overflow:auto;border-right:1px solid rgba(237,231,219,.14)}
-  #right{padding:16px 20px;overflow:auto;display:flex;flex-direction:column;gap:12px}
-  fieldset{border:1px solid rgba(237,231,219,.16);border-radius:10px;padding:12px 14px;margin:0 0 14px}
-  legend{font:700 11px/1 Barlow,sans-serif;text-transform:uppercase;letter-spacing:.09em;
-         color:var(--teal);padding:0 6px}
-  label{display:block;font-size:12px;font-weight:700;margin:9px 0 3px}
-  input[type=file]{width:100%;font-size:12px;color:var(--slate)}
-  select,input[type=number]{font:400 13px Barlow,sans-serif;padding:6px 9px;border-radius:8px;
-    border:1px solid rgba(237,231,219,.22);background:#2B2721;color:#EDE7DB;width:100%}
-  .two{display:grid;grid-template-columns:1fr 1fr;gap:9px}
-  .chk{display:flex;gap:8px;align-items:flex-start;margin:9px 0;font-weight:400;font-size:12.5px}
-  .chk input{margin-top:3px;accent-color:var(--teal);flex:none}
-  .chk span small{display:block;color:var(--faint);font-size:11px;line-height:1.4}
-  .btn{font:700 13px Barlow,sans-serif;cursor:pointer;background:#2B2721;color:#EDE7DB;
-       border:1px solid rgba(237,231,219,.22);border-radius:999px;padding:9px 16px;margin:4px 4px 0 0}
-  .btn:hover:not(:disabled){background:#3A342C}
-  .btn.pri{background:var(--teal);color:#10221E;border-color:var(--teal)}
-  .btn.warn{background:var(--amber);color:#2A2520;border-color:var(--amber)}
-  .btn:disabled{opacity:.38;cursor:default}
-  #stagewrap{background:#000;border:1px solid rgba(237,231,219,.14);border-radius:10px;
+  #side{padding:18px 22px;overflow:auto;border-right:2px solid var(--ink)}
+  #right{padding:18px 22px;overflow:auto;display:flex;flex-direction:column;gap:14px}
+
+  fieldset{border:1px solid var(--ink);border-radius:0;padding:14px 16px;margin:0 0 16px;
+           background:var(--canvas-lift)}
+  legend{font-family:var(--font-mono);font-weight:500;font-size:10px;letter-spacing:0.14em;
+         text-transform:uppercase;color:var(--ink);background:var(--canvas);
+         border:1px solid var(--ink);padding:3px 8px}
+  label{display:block;font-family:var(--font-mono);font-size:10px;letter-spacing:0.1em;
+        text-transform:uppercase;color:var(--ink-soft);font-weight:500;margin:11px 0 4px}
+  input[type=file]{width:100%;font:400 12px var(--font-body);color:var(--ink-soft)}
+  select,input[type=number]{font:400 13px var(--font-body);color:var(--ink);padding:8px 10px;
+    border:1px solid var(--hairline);background:var(--canvas);border-radius:0;width:100%}
+  select:focus,input:focus{outline:2px solid var(--teal);outline-offset:-2px}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .chk{display:flex;gap:9px;align-items:flex-start;margin:11px 0;
+       font:400 12.5px var(--font-body);text-transform:none;letter-spacing:0;color:var(--ink)}
+  .chk input{margin-top:3px;accent-color:var(--teal-deep);flex:none}
+  .chk span small{display:block;color:var(--ink-soft);font-size:11px;line-height:1.45;margin-top:2px}
+
+  .btn{font-family:var(--font-mono);font-size:11px;letter-spacing:0.1em;text-transform:uppercase;
+       padding:10px 16px;border:2px solid var(--ink);background:var(--canvas);color:var(--ink);
+       border-radius:0;cursor:pointer;transition:all 0.12s;
+       display:inline-flex;align-items:center;gap:6px;margin:5px 5px 0 0}
+  .btn:hover:not(:disabled){background:var(--ink);color:var(--canvas)}
+  .btn.primary{background:var(--ink);color:var(--canvas)}
+  .btn.primary:hover:not(:disabled){background:var(--teal-deep);border-color:var(--teal-deep)}
+  .btn.warn{background:var(--amber);color:var(--ink);border-color:var(--ink)}
+  .btn.warn:hover:not(:disabled){background:var(--ink);color:var(--amber)}
+  .btn:disabled{opacity:.36;cursor:default}
+
+  /* The stage shows the video, not the UI — it stays black by design. */
+  #stagewrap{background:#000;border:2px solid var(--ink);border-radius:0;
              overflow:hidden;aspect-ratio:16/9;flex:none}
   #stage{width:100%;height:100%;border:0;display:block}
-  #pbar{height:7px;border-radius:4px;background:rgba(237,231,219,.14);overflow:hidden}
+
+  #pbar{height:10px;background:var(--canvas-deep);border:1px solid var(--ink);overflow:hidden}
   #pfill{height:100%;width:0;background:var(--teal);transition:width .15s linear}
-  #ptext{font:400 11.5px ui-monospace,"DM Mono",monospace;color:var(--slate);margin-top:5px}
-  #log{font:400 11.5px/1.65 ui-monospace,"DM Mono",monospace;background:#0E0C0A;
-       border:1px solid rgba(237,231,219,.12);border-radius:10px;padding:11px 13px;
-       flex:1;min-height:170px;overflow:auto;white-space:pre-wrap;color:#C9BFB0}
-  #log .ok{color:var(--teal)} #log .err{color:#FF8A93} #log .warn{color:var(--amber)}
-  .note{font-size:11.5px;color:var(--faint);line-height:1.5;margin-top:8px}
+  #ptext{font-family:var(--font-mono);font-size:11px;letter-spacing:0.04em;
+         color:var(--ink-soft);margin-top:6px}
+
+  #log{font-family:var(--font-mono);font-size:11.5px;line-height:1.7;
+       background:var(--canvas-deep);border:1px solid var(--ink);border-radius:0;
+       padding:12px 14px;flex:1;min-height:180px;overflow:auto;
+       white-space:pre-wrap;color:var(--ink)}
+  #log div{border-left:3px solid transparent;padding-left:7px;margin-left:-7px}
+  #log .ok{color:var(--teal-deep);border-left-color:var(--teal)}
+  #log .err{color:var(--red);border-left-color:var(--red)}
+  #log .warn{color:var(--ink);border-left-color:var(--amber);background:#F5C5181F}
+  #log .hd{font-weight:500;letter-spacing:0.1em;text-transform:uppercase;
+           color:var(--ink-soft);margin-top:8px}
+
+  .note{font:400 11.5px/1.55 var(--font-body);color:var(--ink-soft);margin-top:10px}
 </style>
 </head>
 <body>
 
 <header>
-  <h1>mpd-render-web</h1>
-  <div class="sub">deterministic master render · WebCodecs · streams to disk · nothing leaves this machine</div>
+  <h1>MPD Render Studio</h1>
+  <div class="sub">deterministic master render · webcodecs · streams to disk · nothing leaves this machine</div>
 </header>
 
 <main>
@@ -80,7 +126,7 @@
         <div><label>FPS</label>
           <select id="fps"><option>24</option><option selected>30</option><option>60</option></select></div>
       </div>
-      <div class="two" style="margin-top:9px">
+      <div class="two" style="margin-top:10px">
         <div><label>Bitrate</label>
           <select id="br">
             <option value="12000000" selected>12 Mbps</option>
@@ -89,6 +135,10 @@
           </select></div>
         <div><label>Volume %</label><input type="number" id="vol" min="0" max="100" value="100"></div>
       </div>
+      <label>Encoder</label>
+      <select id="encsel"><option value="auto" selected>Auto · fastest measured</option></select>
+      <div class="note">Chrome will not say whether a hardware encoder exists — the flag
+        is a hint, never a guarantee. Inspect measures each one instead.</div>
       <label class="chk"><input type="checkbox" id="pfade" checked>
         <span>Picture fade at chapters<small>Matches the preview dip. The old MediaRecorder export never applied it.</small></span></label>
       <label class="chk"><input type="checkbox" id="afade" checked>
@@ -105,7 +155,7 @@
 
     <button class="btn" id="bInspect" disabled>Inspect</button>
     <button class="btn warn" id="bSheets" disabled>Contact sheets</button>
-    <button class="btn pri" id="bRender" disabled>Render master</button>
+    <button class="btn primary" id="bRender" disabled>Render master</button>
     <button class="btn" id="bCancel" disabled>Cancel</button>
     <div class="note">Chrome asks where to save before rendering starts, then
       writes as it goes. Keep the tab focused — a background tab is throttled.</div>

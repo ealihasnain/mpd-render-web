@@ -1,4 +1,4 @@
-/* @mpd-version render-web 2
+/* @mpd-version render-web 3
    mpd-render-web — deterministic browser render for MPD video shells.
 
    The shell's export loop was already deterministic: it paints from a frame
@@ -6,6 +6,20 @@
    which stamps frames as they arrive, so 190ms-per-frame rasterisation became
    a 53-minute file. WebCodecs takes the timestamp as an argument instead, so
    frame n is stamped n/fps no matter how long it took to draw.
+
+   Version 3 fixes the throughput, which turned out not to be the rasteriser.
+   On EP002 the fast rasteriser measured 9ms/frame and the run took 106ms/frame:
+   17,073 frames in 30.1 minutes is 9.4fps, which is what Chrome's software
+   H.264 encoder does at 1080p. `configure()` never named an acceleration
+   preference, so the browser chose, and it chose software while the machine's
+   hardware encoder sat idle.
+
+   There is no way to ask whether a hardware encoder exists.
+   `hardwareAcceleration` is a hint, `isConfigSupported` reports true for
+   preferences it will silently ignore, and 'require-hardware' is not a value
+   the spec defines. So this version measures instead: benchEncoders() runs real
+   frames through every viable configuration and reports observed fps for each
+   before a single frame of the master is written.
 */
 
 const $ = id => document.getElementById(id);
@@ -13,6 +27,8 @@ const S = {
   win: null, doc: null, live: null, html: null,
   audioBuf: null, audioName: '', htmlName: '',
   cancel: false, running: false, fontCss: '', faces: null, mode: 'fast', wake: null,
+  encBench: null,      // [{p, ok, fps, ...}] from the last benchEncoders() run
+  encBenchKey: '',     // bitrate|fps the bench was measured at — invalidates on change
 };
 
 function log(msg, cls) {
@@ -127,6 +143,142 @@ const VCFG = {
   vp9: t => ({ codec: 'vp09.00.10.08', width: 1920, height: 1080, bitrate: t, framerate: 30 }),
 };
 
+/* ------------------------------------------------------- encoder profiles */
+
+/* Every configuration worth trying. 'prefer-hardware' is a request the browser
+   may ignore without saying so, and software libvpx multithreads in realtime
+   mode where OpenH264 does not — which combination wins is a property of the
+   machine, not of the codec. Hence: measure all of them, pick by stopwatch. */
+const ENC_PROFILES = [
+  { id: 'mp4-hw',    container: 'mp4',  acc: 'prefer-hardware', lat: 'quality',  label: 'MP4 · H.264 · hardware' },
+  { id: 'mp4-hw-rt', container: 'mp4',  acc: 'prefer-hardware', lat: 'realtime', label: 'MP4 · H.264 · hardware, realtime' },
+  { id: 'mp4-sw-rt', container: 'mp4',  acc: 'prefer-software', lat: 'realtime', label: 'MP4 · H.264 · software, realtime' },
+  { id: 'mp4-def',   container: 'mp4',  acc: 'no-preference',   lat: 'quality',  label: 'MP4 · H.264 · browser default' },
+  { id: 'webm-hw',   container: 'webm', acc: 'prefer-hardware', lat: 'quality',  label: 'WebM · VP9 · hardware' },
+  { id: 'webm-hw-rt',container: 'webm', acc: 'prefer-hardware', lat: 'realtime', label: 'WebM · VP9 · hardware, realtime' },
+  { id: 'webm-sw-rt',container: 'webm', acc: 'prefer-software', lat: 'realtime', label: 'WebM · VP9 · software, realtime' },
+  { id: 'webm-def',  container: 'webm', acc: 'no-preference',   lat: 'quality',  label: 'WebM · VP9 · browser default' },
+];
+
+function encConfig(p, bitrate, fps) {
+  const c = {
+    codec: p.container === 'mp4' ? 'avc1.640028' : 'vp09.00.10.08',
+    width: 1920, height: 1080, bitrate, framerate: fps,
+    hardwareAcceleration: p.acc,
+    latencyMode: p.lat,
+  };
+  if (p.container === 'mp4') c.avc = { format: 'avc' };
+  return c;
+}
+
+/* Distinct frames spread across the timeline. Encoding one frame repeatedly
+   would produce trivially small P-frames and flatter the encoder. */
+async function grabSamples(n) {
+  const B = bridge();
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const cv = document.createElement('canvas'); cv.width = 1920; cv.height = 1080;
+    const cx = cv.getContext('2d', { alpha: false });
+    await rasterAt(B.TOTAL * (i + 0.5) / n, cx, 1, S.mode);
+    out.push(cv);
+  }
+  return out;
+}
+
+const BENCH_FRAMES = 48;
+const BENCH_BUDGET_MS = 2600;
+
+async function benchOne(p, samples, bitrate, fps) {
+  const cfg = encConfig(p, bitrate, fps);
+  try {
+    const sup = await VideoEncoder.isConfigSupported(cfg);
+    if (!sup || !sup.supported) return { p, ok: false, why: 'not supported' };
+  } catch (e) { return { p, ok: false, why: 'not supported' }; }
+
+  let err = null;
+  const enc = new VideoEncoder({ output: (c) => { c.close && c.close(); }, error: e => { err = e; } });
+  try { enc.configure(cfg); } catch (e) { return { p, ok: false, why: 'configure rejected' }; }
+
+  const gop = fps * 2, usPerFrame = 1e6 / fps;
+  const t0 = performance.now();
+  let done = 0;
+  for (let f = 0; f < BENCH_FRAMES && !err; f++) {
+    const vf = new VideoFrame(samples[f % samples.length], {
+      timestamp: Math.round(f * usPerFrame), duration: Math.round(usPerFrame),
+    });
+    enc.encode(vf, { keyFrame: f % gop === 0 });
+    vf.close();
+    done++;
+    if (enc.encodeQueueSize > QUEUE_HIGH) {
+      while (enc.encodeQueueSize > QUEUE_LOW && !err) await new Promise(r => setTimeout(r, 2));
+    }
+    /* A configuration this slow is already disqualified; do not spend
+       thirty seconds proving how slow. */
+    if (performance.now() - t0 > BENCH_BUDGET_MS) break;
+  }
+  try { await enc.flush(); } catch (e) { err = err || e; }
+  const ms = performance.now() - t0;
+  try { enc.close(); } catch (e) {}
+  if (err || !done) return { p, ok: false, why: 'encoder error' };
+  return { p, ok: true, fps: done / (ms / 1000), msPerFrame: ms / done, frames: done };
+}
+
+/* Runs the whole matrix and logs it. `want` filters by container when the user
+   has pinned one; 'auto' benches both so a fast WebM path is not hidden behind
+   a slow MP4 default. */
+async function benchEncoders(want, bitrate, fps, totalFrames) {
+  const pool = ENC_PROFILES.filter(p => want === 'auto' || p.container === want);
+  const samples = await grabSamples(6);
+  const results = [];
+  log('Encoder benchmark — measured, not advertised', 'hd');
+  for (let i = 0; i < pool.length; i++) {
+    setProg(i / pool.length, `Benchmarking ${pool[i].label}…`);
+    const r = await benchOne(pool[i], samples, bitrate, fps);
+    results.push(r);
+    if (r.ok) {
+      const est = totalFrames ? ' · ' + fmt(totalFrames / r.fps) + ' for this episode' : '';
+      log(`  ${r.fps.toFixed(1)} fps · ${r.msPerFrame.toFixed(0)}ms/frame — ${r.p.label}${est}`,
+          r.fps >= 25 ? 'ok' : (r.fps < 12 ? 'warn' : ''));
+    } else {
+      log(`  —      ${r.p.label} (${r.why})`);
+    }
+    await new Promise(r2 => setTimeout(r2, 0));
+  }
+  const ok = results.filter(r => r.ok).sort((a, b) => b.fps - a.fps);
+  S.encBench = results;
+  S.encBenchKey = bitrate + '|' + fps + '|' + want;
+  fillEncSelect(results);
+  if (!ok.length) { log('No encoder configuration completed. This browser cannot write a master.', 'err'); return null; }
+
+  const best = ok[0], worst = ok[ok.length - 1];
+  if (ok.length > 1 && best.fps / worst.fps > 1.5) {
+    log(`Fastest is ${(best.fps / worst.fps).toFixed(1)}x the slowest — the encoder, not the rasteriser, sets the runtime.`, 'ok');
+  }
+  if (best.p.acc === 'prefer-software' || best.fps < 15) {
+    log('No hardware encoder appears to be in play. Expect a long run; the machine may lack one, or Chrome may be blocking it (check chrome://gpu).', 'warn');
+  }
+  return best.p;
+}
+
+function fillEncSelect(results) {
+  const sel = $('encsel');
+  const keep = sel.value;
+  sel.innerHTML = '<option value="auto">Auto · fastest measured</option>';
+  for (const r of results) {
+    if (!r.ok) continue;
+    const o = document.createElement('option');
+    o.value = r.p.id;
+    o.textContent = `${r.p.label} — ${r.fps.toFixed(1)} fps`;
+    sel.appendChild(o);
+  }
+  if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
+}
+
+/* Encoder backpressure. The old 8/4 pair meant a fast hardware encoder spent
+   its time waiting on a 4ms poll rather than encoding. */
+const QUEUE_HIGH = 30;
+const QUEUE_LOW = 15;
+
 async function probeCodecs(bitrate) {
   const out = { h264: false, vp9: false, aac: false, opus: false };
   if (typeof VideoEncoder === 'undefined') return out;
@@ -161,6 +313,32 @@ function chooseContainer(caps, want) {
     : { container: 'webm', vcodec: 'vp09.00.10.08', vshort: 'V_VP9', acodec: 'opus', ashort: 'A_OPUS', ext: 'webm', audioOk: caps.opus };
 }
 
+/* A benchmarked profile already names its container, so it decides the pairing
+   rather than the caps probe. VP9 still never enters an MP4. */
+function pickFromProfile(profile, caps) {
+  const base = chooseContainer(caps, profile.container);
+  if (base.err) return base;
+  base.acc = profile.acc;
+  base.lat = profile.lat;
+  base.profileLabel = profile.label;
+  base.profileId = profile.id;
+  return base;
+}
+
+/* Which profile the render should use: the explicit override, else the fastest
+   measured, else nothing (caller benches first). */
+function chosenProfile() {
+  const want = $('encsel').value;
+  if (want !== 'auto') return ENC_PROFILES.find(p => p.id === want) || null;
+  if (!S.encBench) return null;
+  const ok = S.encBench.filter(r => r.ok).sort((a, b) => b.fps - a.fps);
+  return ok.length ? ok[0].p : null;
+}
+
+function benchIsStale(want, bitrate, fps) {
+  return S.encBenchKey !== bitrate + '|' + fps + '|' + want;
+}
+
 async function inspect() {
   clearLog();
   const B = bridge();
@@ -186,14 +364,25 @@ async function inspect() {
 
   const par = await runParity(4);
   const fps = +$('fps').value;
+  const bitrate = +$('br').value;
   const frames = Math.round(B.TOTAL * fps);
-  if (par.ok) {
-    log(`Fast rasteriser verified pixel-identical (${par.fastMs.toFixed(0)}ms vs ${par.shellMs.toFixed(0)}ms shell)`, 'ok');
-    log(`${frames} frames ≈ ${fmt(frames * par.fastMs / 1000)} to render`);
-  } else {
-    log(`Fast rasteriser differs (max ${par.worst}, ${par.ndiff}px) — will use the shell path`, 'warn');
-    log(`${frames} frames ≈ ${fmt(frames * par.shellMs / 1000)} to render`);
-  }
+  S.mode = par.ok ? 'fast' : 'shell';
+  if (par.ok) log(`Fast rasteriser verified pixel-identical (${par.fastMs.toFixed(0)}ms vs ${par.shellMs.toFixed(0)}ms shell)`, 'ok');
+  else log(`Fast rasteriser differs (max ${par.worst}, ${par.ndiff}px) — will use the shell path`, 'warn');
+  const rasterMs = par.ok ? par.fastMs : par.shellMs;
+
+  const best = await benchEncoders($('fmtsel').value, bitrate, fps, frames);
+  if (!best) { setProg(0, 'Inspect done'); return; }
+
+  /* Rasterising and encoding overlap, so the run is governed by whichever is
+     slower, not by their sum. Version 2 projected on the rasteriser alone and
+     under-read a 30-minute render as 2:39. */
+  const encMs = 1000 / S.encBench.filter(r => r.ok).sort((a, b) => b.fps - a.fps)[0].fps;
+  const perFrame = Math.max(rasterMs, encMs);
+  log(`Fastest path — ${best.label}`, 'ok');
+  log(`Raster ${rasterMs.toFixed(0)}ms · encode ${encMs.toFixed(0)}ms · ${perFrame === encMs ? 'encoder-bound' : 'rasteriser-bound'}`);
+  log(`${frames} frames ≈ ${fmt(frames * perFrame / 1000)} to render`, 'ok');
+
   if (!window.showSaveFilePicker) log('No File System Access API — output must buffer in RAM. Use Chrome or Edge.', 'warn');
   setProg(0, 'Inspect done');
 }
@@ -400,7 +589,25 @@ async function render() {
     const fadeA = $('afade').checked ? (B.FADE_A != null ? B.FADE_A : 0.45) : 0;
 
     const caps = await probeCodecs(bitrate);
-    const pick = chooseContainer(caps, $('fmtsel').value);
+    const want = $('fmtsel').value;
+    const totalFramesEarly = Math.round(TOTAL * fps);
+
+    /* Verify the fast rasteriser before benching — the bench encodes real
+       frames, so it needs to know which path produces them. */
+    setProg(0, 'Checking rasteriser…');
+    const par0 = await runParity(3);
+    S.mode = par0.ok ? 'fast' : 'shell';
+    if (par0.ok) log(`Fast rasteriser verified pixel-identical — ${par0.fastMs.toFixed(0)}ms/frame (shell path ${par0.shellMs.toFixed(0)}ms)`, 'ok');
+    else log(`Fast rasteriser differs (max channel ${par0.worst}) — falling back to the shell path`, 'warn');
+
+    let profile = chosenProfile();
+    if (!profile || ($('encsel').value === 'auto' && benchIsStale(want, bitrate, fps))) {
+      profile = await benchEncoders(want, bitrate, fps, totalFramesEarly);
+      if (!profile) throw new Error('No encoder configuration completed the benchmark.');
+    } else {
+      log(`Encoder — ${profile.label}${$('encsel').value === 'auto' ? ' (fastest measured)' : ' (pinned)'}`, 'ok');
+    }
+    const pick = pickFromProfile(profile, caps);
     if (pick.err) throw new Error(pick.err);
 
     const env = makeEnvelope(CHAPTERS, TOTAL);
@@ -415,14 +622,10 @@ async function render() {
     const totalFrames = Math.round(TOTAL * fps);
     log(`Writing .${pick.ext} · ${pick.vshort}${withAudio ? ' + ' + pick.ashort : ''} · ${totalFrames} frames @ ${fps}fps · ${(bitrate / 1e6).toFixed(0)} Mbps`);
 
-    /* Verify the fast rasteriser before spending the run on it. */
-    setProg(0, 'Checking rasteriser…');
-    const par = await runParity(3);
-    S.mode = par.ok ? 'fast' : 'shell';
-    if (par.ok) log(`Fast rasteriser verified pixel-identical — ${par.fastMs.toFixed(0)}ms/frame (shell path ${par.shellMs.toFixed(0)}ms)`, 'ok');
-    else log(`Fast rasteriser differs (max channel ${par.worst}) — falling back to the shell path`, 'warn');
-    const estMs = par.ok ? par.fastMs : par.shellMs;
-    log(`Estimated ${fmt(totalFrames * estMs / 1000)} of rendering`);
+    const benchBest = S.encBench && S.encBench.filter(r => r.ok).find(r => r.p.id === profile.id);
+    const rasterMs = par0.ok ? par0.fastMs : par0.shellMs;
+    const encMs = benchBest ? 1000 / benchBest.fps : rasterMs;
+    log(`Estimated ${fmt(totalFrames * Math.max(rasterMs, encMs) / 1000)} of rendering`);
 
     /* An hour of 1080p at 16 Mbps is over a gigabyte. Held in an
        ArrayBuffer that gets the tab killed, so stream it to disk. */
@@ -472,9 +675,13 @@ async function render() {
       output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
       error: e => { encErr = e; },
     });
+    /* The fix. Without hardwareAcceleration the browser picked software H.264
+       and delivered 9.4fps on a machine with an idle hardware encoder. */
     venc.configure({
       codec: pick.vcodec, width: 1920, height: 1080,
       bitrate, framerate: fps,
+      hardwareAcceleration: pick.acc,
+      latencyMode: pick.lat,
       ...(pick.container === 'mp4' ? { avc: { format: 'avc' } } : {}),
     });
 
@@ -517,6 +724,7 @@ async function render() {
     const cx = cv.getContext('2d', { alpha: false });
     const gopSize = fps * 2;
     const usPerFrame = 1e6 / fps;
+    let waitMs = 0;
 
     for (let f = 0; f < totalFrames; f++) {
       if (S.cancel) throw new Error('cancelled');
@@ -534,14 +742,17 @@ async function render() {
       venc.encode(vf, { keyFrame: f % gopSize === 0 });
       vf.close();
 
-      if (venc.encodeQueueSize > 8) {
-        while (venc.encodeQueueSize > 4) await new Promise(r => setTimeout(r, 4));
+      if (venc.encodeQueueSize > QUEUE_HIGH) {
+        const w0 = performance.now();
+        while (venc.encodeQueueSize > QUEUE_LOW) await new Promise(r => setTimeout(r, 2));
+        waitMs += performance.now() - w0;
       }
       if (f % 10 === 0 || f === totalFrames - 1) {
         const el = (performance.now() - started) / 1000;
         const per = el / (f + 1);
         const left = (totalFrames - f - 1) * per;
-        setProg(f / totalFrames, `frame ${f + 1}/${totalFrames} · ${(per * 1000).toFixed(0)}ms/frame · ${fmt(left)} left`);
+        const stall = Math.round(waitMs / (el * 1000) * 100);
+        setProg(f / totalFrames, `frame ${f + 1}/${totalFrames} · ${(per * 1000).toFixed(0)}ms/frame · ${stall}% waiting on encoder · ${fmt(left)} left`);
         await new Promise(r => setTimeout(r, 0));
       }
     }
@@ -555,6 +766,7 @@ async function render() {
     if (fileStream) {
       await fileStream.close();
       log(`Done — written to ${base} in ${mins.toFixed(1)} min`, 'ok');
+      log(`${(mins * 60000 / totalFrames).toFixed(0)}ms/frame · ${Math.round(waitMs / (mins * 600))}% of it waiting on the encoder`);
     } else {
       const blob = new Blob([target.buffer], { type: pick.container === 'mp4' ? 'video/mp4' : 'video/webm' });
       download(blob, base);
