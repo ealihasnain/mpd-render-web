@@ -1,4 +1,4 @@
-/* @mpd-version render-web 4
+/* @mpd-version render-web 5
    mpd-render-web — deterministic browser render for MPD video shells.
 
    The shell's export loop was already deterministic: it paints from a frame
@@ -701,10 +701,237 @@ function buildAudio(srcBuf, TOTAL, audioDur, env, duckIn, duckOut, gain) {
   return { channels: out, sampleRate: sr, numberOfChannels: chs, length: outLen };
 }
 
+/* ------------------------------------------------------------- transport */
+
+/* Preview playback. The shell's own transport is hidden by the bridge CSS, so
+   this drives paint(t) directly and runs the audio through Web Audio in
+   parallel. Two things it does that the shell's preview cannot:
+
+   - applies the picture fade and audio duck from THIS app's four duration
+     fields, so an asymmetric fade can be seen before committing an hour to a
+     master. The shell's envelope() is symmetric and cannot show it.
+   - stays in sync at speeds other than 1x, because the audio node's
+     playbackRate and the paint clock are read from the same source.
+
+   When audio is loaded it is the clock — AudioContext.currentTime is far
+   steadier than accumulating rAF deltas, and drift on a nine-minute preview is
+   what makes a preview useless for checking sync. */
+const PV = {
+  t: 0, playing: false, speed: 1, vol: 1,
+  ctx: null, src: null, gain: null, raf: null,
+  anchorT: 0, anchorCtx: 0, anchorWall: 0,
+};
+
+function pvTotal() { try { return bridge().TOTAL; } catch (e) { return 0; } }
+function pvChapters() { try { return bridge().CHAPTERS || []; } catch (e) { return []; } }
+
+function pvFades() {
+  return {
+    vIn: $('pfade').checked ? Math.max(0, +$('vin').value) : 0,
+    vOut: $('pfade').checked ? Math.max(0, +$('vout').value) : 0,
+    aIn: $('afade').checked ? Math.max(0, +$('ain').value) : 0,
+    aOut: $('afade').checked ? Math.max(0, +$('aout').value) : 0,
+  };
+}
+
+function pvEnv() {
+  if (!PV._env) PV._env = makeEnvelope(pvChapters(), pvTotal());
+  return PV._env;
+}
+
+function pvAudioCtx() {
+  if (!PV.ctx) {
+    PV.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    PV.gain = PV.ctx.createGain();
+    PV.gain.connect(PV.ctx.destination);
+  }
+  return PV.ctx;
+}
+
+function pvStartAudio() {
+  if (!S.audioBuf) return;
+  pvStopAudio();
+  const ctx = pvAudioCtx();
+  if (ctx.state === 'suspended') ctx.resume();
+  if (PV.t >= S.audioBuf.duration) return;   // past the narration; picture only
+  const src = ctx.createBufferSource();
+  src.buffer = S.audioBuf;
+  src.playbackRate.value = PV.speed;
+  src.connect(PV.gain);
+  src.start(0, PV.t);
+  PV.src = src;
+  PV.anchorT = PV.t;
+  PV.anchorCtx = ctx.currentTime;
+}
+
+function pvStopAudio() {
+  if (PV.src) { try { PV.src.stop(); } catch (e) {} try { PV.src.disconnect(); } catch (e) {} PV.src = null; }
+}
+
+function pvPlay() {
+  if (!S.win || PV.playing || S.running) return;
+  if (PV.t >= pvTotal() - 1e-3) PV.t = 0;
+  PV.playing = true;
+  PV.anchorWall = performance.now();
+  pvStartAudio();
+  PV.raf = requestAnimationFrame(pvTick);
+  pvSyncUI();
+}
+
+function pvPause() {
+  if (!PV.playing) return;
+  PV.playing = false;
+  pvStopAudio();
+  if (PV.raf) cancelAnimationFrame(PV.raf), PV.raf = null;
+  pvSyncUI();
+}
+
+function pvStop() {
+  pvPause();
+  pvGoto(0);
+}
+
+function pvTogglePlay() { PV.playing ? pvPause() : pvPlay(); }
+
+function pvGoto(t) {
+  const total = pvTotal();
+  PV.t = Math.max(0, Math.min(total, t));
+  PV.anchorWall = performance.now();
+  if (PV.playing) pvStartAudio();
+  pvPaint();
+  pvSyncUI();
+}
+
+function pvSkip(dir) { pvGoto(PV.t + dir * (+$('pvJump').value)); }
+
+function pvChapterStep(dir) {
+  const ch = pvChapters();
+  if (!ch.length) return;
+  let idx = 0;
+  for (let i = 0; i < ch.length; i++) if (ch[i].start <= PV.t + 1e-3) idx = i;
+  /* Stepping back from mid-chapter restarts the current one first, which is
+     what the button is nearly always wanted for. */
+  if (dir < 0 && PV.t - ch[idx].start > 1.0) { pvGoto(ch[idx].start); return; }
+  const next = Math.max(0, Math.min(ch.length - 1, idx + dir));
+  pvGoto(ch[next].start);
+}
+
+function pvSetSpeed() {
+  PV.speed = +$('pvSpeed').value;
+  if (PV.playing) pvStartAudio();   // playbackRate is fixed at start; restart from t
+  PV.anchorWall = performance.now();
+}
+
+function pvSetVol() {
+  PV.vol = (+$('pvVol').value) / 100;
+}
+
+/* Picture opacity and audio gain both come from the same envelope, so what the
+   preview shows and what the master writes cannot disagree. */
+function pvPaint() {
+  if (!S.win || typeof S.win.paint !== 'function') return;
+  const f = pvFades();
+  S.win.paint(PV.t);
+  const op = (f.vIn > 0 || f.vOut > 0) ? (0.06 + 0.94 * pvEnv()(PV.t, f.vIn, f.vOut)) : 1;
+  if (S.live) S.live.style.opacity = op;
+  if (PV.gain) {
+    let g = (f.aIn > 0 || f.aOut > 0) ? pvEnv()(PV.t, f.aIn, f.aOut) : 1;
+    const dur = S.audioBuf ? S.audioBuf.duration : 0;
+    if (f.aOut > 0 && dur && dur - PV.t < f.aOut) g = Math.min(g, Math.max(0, (dur - PV.t) / f.aOut));
+    PV.gain.gain.value = g * PV.vol;
+  }
+}
+
+function pvTick() {
+  if (!PV.playing) return;
+  const total = pvTotal();
+  if (PV.src && PV.ctx) {
+    PV.t = PV.anchorT + (PV.ctx.currentTime - PV.anchorCtx) * PV.speed;
+  } else {
+    const now = performance.now();
+    PV.t += (now - PV.anchorWall) / 1000 * PV.speed;
+    PV.anchorWall = now;
+  }
+  if (PV.t >= total) { PV.t = total; pvPause(); pvPaint(); pvSyncUI(); return; }
+  /* Audio runs out before the picture on episodes with an outro card. Hand the
+     clock back to the wall before the source ends, not after. */
+  if (PV.src && S.audioBuf && PV.t >= S.audioBuf.duration - 0.05) {
+    pvStopAudio(); PV.anchorWall = performance.now();
+  }
+  pvPaint();
+  pvSyncUI();
+  PV.raf = requestAnimationFrame(pvTick);
+}
+
+function pvSyncUI() {
+  const total = pvTotal();
+  $('pvPlay').textContent = PV.playing ? '❚❚ Pause' : '▶ Play';
+  $('pvTime').textContent = fmt(PV.t) + ' / ' + fmt(total);
+  $('pvScrubFill').style.width = (total ? PV.t / total * 100 : 0) + '%';
+  const ch = pvChapters();
+  let idx = -1;
+  for (let i = 0; i < ch.length; i++) if (ch[i].start <= PV.t + 1e-3) idx = i;
+  const btns = $('pvChaps').children;
+  for (let i = 0; i < btns.length; i++) btns[i].classList.toggle('on', i === idx);
+}
+
+function pvEnable(on) {
+  ['pvPlay', 'pvStop', 'pvBack', 'pvFwd'].forEach(id => { $(id).disabled = !on; });
+  for (const b of $('pvChaps').children) b.disabled = !on;
+}
+
+function pvBuild() {
+  PV._env = null;
+  PV.t = 0; PV.playing = false;
+  const wrap = $('pvChaps');
+  wrap.innerHTML = '';
+  pvChapters().forEach((c, i) => {
+    const b = document.createElement('button');
+    b.className = 'chbtn';
+    b.textContent = (i + 1);
+    b.title = (c.title || ('Chapter ' + (i + 1))) + ' · ' + fmt(c.start);
+    b.onclick = () => pvGoto(c.start);
+    wrap.appendChild(b);
+  });
+  $('pvHint').textContent = S.audioBuf
+    ? 'Space plays, ← → skip, ↑ ↓ chapter. Fade and duck fields apply live.'
+    : 'Picture only — load a voice mix to preview audio. Space plays, ← → skip, ↑ ↓ chapter.';
+  pvEnable(true);
+  pvPaint();
+  pvSyncUI();
+}
+
+function pvWire() {
+  $('pvPlay').onclick = pvTogglePlay;
+  $('pvStop').onclick = pvStop;
+  $('pvBack').onclick = () => pvSkip(-1);
+  $('pvFwd').onclick = () => pvSkip(1);
+  $('pvSpeed').onchange = pvSetSpeed;
+  $('pvVol').oninput = pvSetVol;
+  $('pvScrub').onclick = e => {
+    const r = e.currentTarget.getBoundingClientRect();
+    pvGoto((e.clientX - r.left) / r.width * pvTotal());
+  };
+  ['vin', 'vout', 'ain', 'aout', 'pfade', 'afade'].forEach(id => {
+    const el = $(id); if (el) el.addEventListener('change', () => { if (S.win) pvPaint(); });
+  });
+  document.addEventListener('keydown', e => {
+    if (!S.win || S.running) return;
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'select' || tag === 'textarea') return;
+    if (e.code === 'Space') { e.preventDefault(); pvTogglePlay(); }
+    else if (e.code === 'ArrowLeft') { e.preventDefault(); pvSkip(-1); }
+    else if (e.code === 'ArrowRight') { e.preventDefault(); pvSkip(1); }
+    else if (e.code === 'ArrowUp') { e.preventDefault(); pvChapterStep(-1); }
+    else if (e.code === 'ArrowDown') { e.preventDefault(); pvChapterStep(1); }
+  });
+}
+
 /* ----------------------------------------------------------------- render */
 
 async function render() {
   if (S.running) return;
+  pvPause(); pvEnable(false);
   S.running = true; S.cancel = false;
   $('bRender').disabled = true; $('bCancel').disabled = false;
   clearLog();
@@ -944,6 +1171,7 @@ async function render() {
     S.running = false;
     try { if (S.wake) { await S.wake.release(); S.wake = null; } } catch (e) {}
     $('bRender').disabled = false; $('bCancel').disabled = true;
+    if (S.win) pvEnable(true);
   }
 }
 
@@ -959,6 +1187,7 @@ function download(blob, name) {
 
 async function sheets() {
   if (S.running) return;
+  pvPause(); pvEnable(false);
   S.running = true; S.cancel = false;
   $('bSheets').disabled = true; $('bCancel').disabled = false;
   clearLog();
@@ -1020,6 +1249,7 @@ async function sheets() {
   } finally {
     S.running = false;
     $('bSheets').disabled = false; $('bCancel').disabled = true;
+    if (S.win) pvEnable(true);
   }
 }
 
@@ -1039,7 +1269,11 @@ ready(() => {
     clearLog(); enable(false);
     log(`Loading ${f.name}…`);
     if (await loadEpisode(f)) {
-      try { const B = bridge(); log(`${B.EPISODE.id} · ${fmt(B.TOTAL)} · ${B.TIMELINE.length} beats`, 'ok'); enable(true); }
+      try {
+        const B = bridge();
+        log(`${B.EPISODE.id} · ${fmt(B.TOTAL)} · ${B.TIMELINE.length} beats`, 'ok');
+        enable(true); pvBuild();
+      }
       catch (err) { log(err.message, 'err'); }
     }
   };
@@ -1048,6 +1282,7 @@ ready(() => {
     try {
       S.audioBuf = await decodeAudio(f); S.audioName = f.name;
       log(`Audio ${f.name} — ${fmt(S.audioBuf.duration)} @ ${S.audioBuf.sampleRate}Hz`, 'ok');
+      if (S.win) pvBuild();
       try {
         const B = bridge();
         const narrated = (typeof B.EPISODE.audioDur === 'number') ? B.EPISODE.audioDur : B.TOTAL;
@@ -1056,6 +1291,7 @@ ready(() => {
       } catch (_) {}
     } catch (err) { log('Could not decode that audio: ' + err.message, 'err'); }
   };
+  pvWire();
   $('bInspect').onclick = () => inspect().catch(e => log(e.message, 'err'));
   $('bSheets').onclick = sheets;
   $('bRender').onclick = render;

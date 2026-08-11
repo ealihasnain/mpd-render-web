@@ -1,4 +1,4 @@
-# mpd-render-web 4
+# mpd-render-web 5
 
 Deterministic master render for MoneyPatternsDecoded video shells. Runs entirely
 in the browser — no Python, no admin rights, no install, nothing uploaded.
@@ -77,6 +77,28 @@ Rather than guess a third time, version 4 measures the loop that does the work:
   so frame *n+1* decodes while frame *n* is encoded. The snapshot is a string,
   so painting *n+1* cannot disturb a decode already in flight.
 - **Elapsed time and projected finish clock** alongside time remaining.
+
+### Preview transport
+
+Play/pause, stop, skip (2/3/5/10/15/20/30s), numbered chapter buttons, speed
+(0.5/1/2/4/8x), volume, a click-to-seek scrub bar, and keyboard control —
+space to play, arrows to skip, up/down for chapter. It drives the shell's
+`paint(t)` directly; the shell's own transport stays hidden.
+
+Two things it does that the shell's preview cannot:
+
+- **It shows the fade you configured here**, picture and audio, including
+  asymmetric in/out durations the shell's symmetric `envelope()` has no way to
+  express. Both are read from the same curve the master uses, so preview and
+  output cannot disagree. The fields apply live — change one mid-scrub and the
+  frame updates.
+- **It stays in sync above 1x**, because when audio is loaded the
+  `AudioContext` clock drives the paint rather than accumulated
+  requestAnimationFrame deltas. Drift over a nine-minute preview is exactly what
+  makes a preview useless for checking sync.
+
+Audio ends before the picture on episodes with an outro card; the clock hands
+back to the wall clock before the source runs out rather than after.
 
 ### Fade and duck durations
 

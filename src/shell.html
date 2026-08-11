@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- @mpd-version render-web 4 -->
+<!-- @mpd-version render-web 5 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -93,6 +93,25 @@
            color:var(--ink-soft);margin-top:8px}
 
   .note{font:400 11.5px/1.55 var(--font-body);color:var(--ink-soft);margin-top:10px}
+
+  /* transport */
+  #transport{border:1px solid var(--ink);background:var(--canvas-lift);padding:10px 12px}
+  .tp-row{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+  .btn.pv{padding:7px 12px;font-size:11px;margin:0}
+  .tp-sel{width:auto;min-width:62px;padding:6px 8px;font-family:var(--font-mono);font-size:11px}
+  .tp-vol{display:flex;align-items:center;gap:6px;margin-left:2px}
+  .tp-lab{font-family:var(--font-mono);font-size:9px;letter-spacing:0.12em;color:var(--ink-soft)}
+  .tp-vol input[type=range]{width:88px;accent-color:var(--teal-deep);padding:0;border:0;background:transparent}
+  .tp-time{margin-left:auto;font-family:var(--font-mono);font-size:12px;color:var(--ink)}
+  #pvScrubWrap{margin-top:9px}
+  #pvScrub{height:12px;background:var(--canvas-deep);border:1px solid var(--ink);cursor:pointer;position:relative}
+  #pvScrubFill{height:100%;width:0;background:var(--teal);pointer-events:none}
+  #pvChaps{display:flex;gap:5px;flex-wrap:wrap;margin-top:9px}
+  .chbtn{font-family:var(--font-mono);font-size:10px;letter-spacing:0.06em;padding:5px 9px;
+         border:1px solid var(--ink);background:var(--canvas);color:var(--ink);cursor:pointer}
+  .chbtn:hover{background:var(--ink);color:var(--canvas)}
+  .chbtn.on{background:var(--teal-deep);border-color:var(--teal-deep);color:var(--canvas)}
+  .tp-hint{font:400 11px/1.5 var(--font-body);color:var(--ink-soft);margin-top:8px}
 </style>
 </head>
 <body>
@@ -173,6 +192,34 @@
 
   <div id="right">
     <div id="stagewrap"><iframe id="stage"></iframe></div>
+
+    <div id="transport">
+      <div class="tp-row">
+        <button class="btn pv" id="pvPlay" disabled>▶ Play</button>
+        <button class="btn pv" id="pvStop" disabled>■ Stop</button>
+        <button class="btn pv" id="pvBack" disabled>◀◀</button>
+        <button class="btn pv" id="pvFwd" disabled>▶▶</button>
+        <select id="pvJump" class="tp-sel" title="skip amount">
+          <option value="2">2s</option><option value="3">3s</option>
+          <option value="5" selected>5s</option><option value="10">10s</option>
+          <option value="15">15s</option><option value="20">20s</option>
+          <option value="30">30s</option>
+        </select>
+        <select id="pvSpeed" class="tp-sel" title="playback speed">
+          <option value="0.5">0.5×</option><option value="1" selected>1×</option>
+          <option value="2">2×</option><option value="4">4×</option><option value="8">8×</option>
+        </select>
+        <span class="tp-vol">
+          <span class="tp-lab">VOL</span>
+          <input type="range" id="pvVol" min="0" max="100" value="100">
+        </span>
+        <span class="tp-time" id="pvTime">0:00 / 0:00</span>
+      </div>
+      <div id="pvScrubWrap"><div id="pvScrub"><div id="pvScrubFill"></div></div></div>
+      <div id="pvChaps"></div>
+      <div class="tp-hint" id="pvHint">Load an episode to preview. Space plays, ← → skip, ↑ ↓ change chapter.</div>
+    </div>
+
     <div>
       <div id="pbar"><div id="pfill"></div></div>
       <div id="ptext">Idle</div>
