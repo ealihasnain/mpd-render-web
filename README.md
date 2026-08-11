@@ -1,4 +1,4 @@
-# mpd-render-web 3
+# mpd-render-web 4
 
 Deterministic master render for MoneyPatternsDecoded video shells. Runs entirely
 in the browser — no Python, no admin rights, no install, nothing uploaded.
@@ -52,6 +52,41 @@ There is no clean way to ask whether a hardware encoder is really in play.
 Expect single-digit minutes where a hardware encoder exists. Where none does,
 software VP9 in `realtime` mode multithreads and generally beats OpenH264 — the
 benchmark will find it.
+
+## What version 4 fixes
+
+Version 3 halved the EP002 render, 30.1 min to 15.0 — and then reported
+`0% of it waiting on the encoder`. The codec was no longer the constraint. The
+projection said 3:47 and the run took 15:00, so for the second time a model
+built from measured parts was wrong about the whole: the rasteriser benched at
+13ms and the loop ran at 53ms, with 40ms/frame belonging to neither the
+rasteriser nor the encoder.
+
+Rather than guess a third time, version 4 measures the loop that does the work:
+
+- **`trialRun()`** runs the real pipeline — compose, decode, `VideoFrame`,
+  encode — for 24 frames against a throwaway encoder, and reports the per-phase
+  split. Whatever the expensive step is, it is inside the measurement by
+  construction. The estimate is labelled a floor, because a sustained run
+  carries GC and compositing overhead a 24-frame sample does not.
+- **Per-phase totals after every render**, including an explicit *unaccounted*
+  line when the phases fail to add up to the wall clock. A future change gets
+  aimed at whichever phase is actually large.
+- **Prefetch pipeline.** `rasterAt()` is split into a synchronous
+  `composeFrame()` and an asynchronous `decodeToCanvas()`, across two canvases,
+  so frame *n+1* decodes while frame *n* is encoded. The snapshot is a string,
+  so painting *n+1* cannot disturb a decode already in flight.
+- **Elapsed time and projected finish clock** alongside time remaining.
+
+### Fade and duck durations
+
+Picture fade and audio duck each take separate **in** and **out** durations,
+defaulting to 1.0s, where the shell's `envelope()` has one symmetric value.
+Equal values reproduce the shell exactly and `verifyEnvelope()` proves it at
+1,200 sample points. Unequal values are something the shell's preview cannot
+display, and the log says so plainly rather than reporting it as a fault: for
+asymmetric fades the master is the reference for how the fade looks, the
+preview only for when it happens.
 
 ## Requirements
 

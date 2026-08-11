@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- @mpd-version render-web 3 -->
+<!-- @mpd-version render-web 4 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -140,9 +140,19 @@
       <div class="note">Chrome will not say whether a hardware encoder exists — the flag
         is a hint, never a guarantee. Inspect measures each one instead.</div>
       <label class="chk"><input type="checkbox" id="pfade" checked>
-        <span>Picture fade at chapters<small>Matches the preview dip. The old MediaRecorder export never applied it.</small></span></label>
-      <label class="chk"><input type="checkbox" id="afade" checked>
-        <span>Audio duck at chapters<small>Same curve as the picture fade — replaces the ffmpeg -af string.</small></span></label>
+        <span>Picture fade at chapters<small>Fades out into each chapter boundary and back in after it.</small></span></label>
+      <div class="two">
+        <div><label>Fade in (s)</label><input type="number" id="vin" min="0" max="5" step="0.05" value="1.0"></div>
+        <div><label>Fade out (s)</label><input type="number" id="vout" min="0" max="5" step="0.05" value="1.0"></div>
+      </div>
+      <label class="chk" style="margin-top:14px"><input type="checkbox" id="afade" checked>
+        <span>Audio duck at chapters<small>Same shape as the picture fade, applied as gain. Replaces the ffmpeg -af string.</small></span></label>
+      <div class="two">
+        <div><label>Duck in (s)</label><input type="number" id="ain" min="0" max="5" step="0.05" value="1.0"></div>
+        <div><label>Duck out (s)</label><input type="number" id="aout" min="0" max="5" step="0.05" value="1.0"></div>
+      </div>
+      <div class="note">The shell's preview uses one symmetric duration, so unequal
+        in/out values will look different there. The master is the reference.</div>
     </fieldset>
 
     <fieldset>
@@ -3552,7 +3562,7 @@ ${notes}`;
 })();
 if (typeof module === "object" && typeof module.exports === "object") Object.assign(module.exports, WebMMuxer)
 </script>
-<script>/* @mpd-version render-web 3
+<script>/* @mpd-version render-web 4
    mpd-render-web — deterministic browser render for MPD video shells.
 
    The shell's export loop was already deterministic: it paints from a frame
@@ -3597,6 +3607,13 @@ function clearLog() { $('log').innerHTML = ''; }
 function setProg(frac, text) {
   $('pfill').style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
   if (text !== undefined) $('ptext').textContent = text;
+}
+/* Wall-clock finish time. On a fifteen-minute render "done ~14:52" is easier
+   to act on than "12:03 left". */
+function clockAt(secondsFromNow) {
+  if (!isFinite(secondsFromNow)) return '–';
+  const d = new Date(Date.now() + secondsFromNow * 1000);
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
 }
 function fmt(s) {
   if (!isFinite(s)) return '–';
@@ -3833,6 +3850,96 @@ function fillEncSelect(results) {
 const QUEUE_HIGH = 30;
 const QUEUE_LOW = 15;
 
+/* ------------------------------------------------------------- trial run */
+
+/* Twice now a projection built from a measured part has been wrong about the
+   whole: version 2 timed the rasteriser and missed the encoder, version 3
+   timed both and missed 40ms/frame of neither. So this runs the actual loop —
+   same compose, same decode, same VideoFrame construction, same encode — for a
+   handful of frames and reports where the time went. Whatever the expensive
+   step turns out to be, it is inside this measurement by construction.
+
+   The output is discarded; only the clock matters. */
+async function trialRun(profile, bitrate, fps, frames) {
+  const B = bridge();
+  const cfg = encConfig(profile, bitrate, fps);
+  let err = null;
+  const enc = new VideoEncoder({ output: c => { c.close && c.close(); }, error: e => { err = e; } });
+  try { enc.configure(cfg); } catch (e) { return null; }
+
+  const cvs = [0, 1].map(() => { const c = document.createElement('canvas'); c.width = 1920; c.height = 1080; return c; });
+  const ctxs = cvs.map(c => c.getContext('2d', { alpha: false }));
+  const usPerFrame = 1e6 / fps, gop = fps * 2;
+  const T = { compose: 0, decode: 0, frame: 0, wait: 0 };
+
+  /* Sample across the timeline rather than the first second, which on most
+     episodes is a title card and not representative of anything. */
+  const at = i => B.TOTAL * (i + 0.5) / frames;
+
+  let s = performance.now();
+  let svg = composeFrame(at(0), 1, S.mode);
+  T.compose += performance.now() - s;
+  let pending = decodeToCanvas(svg, ctxs[0]);
+  let cur = 0;
+
+  const t0 = performance.now();
+  for (let f = 0; f < frames && !err; f++) {
+    s = performance.now(); await pending; T.decode += performance.now() - s;
+
+    let nextPending = null;
+    if (f + 1 < frames) {
+      s = performance.now();
+      const nsvg = composeFrame(at(f + 1), 1, S.mode);
+      T.compose += performance.now() - s;
+      nextPending = decodeToCanvas(nsvg, ctxs[1 - cur]);
+    }
+
+    s = performance.now();
+    const vf = new VideoFrame(cvs[cur], { timestamp: Math.round(f * usPerFrame), duration: Math.round(usPerFrame) });
+    enc.encode(vf, { keyFrame: f % gop === 0 });
+    vf.close();
+    T.frame += performance.now() - s;
+
+    if (enc.encodeQueueSize > QUEUE_HIGH) {
+      s = performance.now();
+      while (enc.encodeQueueSize > QUEUE_LOW && !err) await new Promise(r => setTimeout(r, 2));
+      T.wait += performance.now() - s;
+    }
+    pending = nextPending; cur = 1 - cur;
+  }
+  const wall = performance.now() - t0;
+  try { await enc.flush(); enc.close(); } catch (e) {}
+  if (err) return null;
+
+  return { msPerFrame: wall / frames, wall, frames,
+           compose: T.compose / frames, decode: T.decode / frames,
+           frameMs: T.frame / frames, wait: T.wait / frames };
+}
+
+function logPhases(tr) {
+  log(`  ${tr.compose.toFixed(0)}ms paint + serialise`);
+  log(`  ${tr.decode.toFixed(0)}ms SVG decode (waited, net of overlap)`);
+  log(`  ${tr.frameMs.toFixed(0)}ms VideoFrame + encode call`);
+  log(`  ${tr.wait.toFixed(0)}ms waiting on the encoder queue`);
+}
+
+/* Printed after every render, so the next change is aimed at whichever phase
+   is actually large rather than the one most recently theorised about. */
+function logRenderPhases(mins, frames, composeMs, decodeMs, frameMs, waitMs) {
+  const per = mins * 60000 / frames;
+  const pc = ms => Math.round(ms / (mins * 600)) + '%';
+  log(`${per.toFixed(0)}ms/frame`, 'hd');
+  log(`  paint + serialise      ${(composeMs / frames).toFixed(0)}ms · ${pc(composeMs)}`);
+  log(`  SVG decode (net)       ${(decodeMs / frames).toFixed(0)}ms · ${pc(decodeMs)}`);
+  log(`  VideoFrame + encode    ${(frameMs / frames).toFixed(0)}ms · ${pc(frameMs)}`);
+  log(`  encoder queue wait     ${(waitMs / frames).toFixed(0)}ms · ${pc(waitMs)}`);
+  const acct = composeMs + decodeMs + frameMs + waitMs;
+  const un = mins * 60000 - acct;
+  if (un / (mins * 60000) > 0.15) {
+    log(`  unaccounted            ${(un / frames).toFixed(0)}ms · ${pc(un)} — browser work outside the loop (GC, compositing)`, 'warn');
+  }
+}
+
 async function probeCodecs(bitrate) {
   const out = { h264: false, vp9: false, aac: false, opus: false };
   if (typeof VideoEncoder === 'undefined') return out;
@@ -3927,15 +4034,23 @@ async function inspect() {
 
   const best = await benchEncoders($('fmtsel').value, bitrate, fps, frames);
   if (!best) { setProg(0, 'Inspect done'); return; }
+  log(`Fastest encoder — ${best.label}`, 'ok');
 
-  /* Rasterising and encoding overlap, so the run is governed by whichever is
-     slower, not by their sum. Version 2 projected on the rasteriser alone and
-     under-read a 30-minute render as 2:39. */
-  const encMs = 1000 / S.encBench.filter(r => r.ok).sort((a, b) => b.fps - a.fps)[0].fps;
-  const perFrame = Math.max(rasterMs, encMs);
-  log(`Fastest path — ${best.label}`, 'ok');
-  log(`Raster ${rasterMs.toFixed(0)}ms · encode ${encMs.toFixed(0)}ms · ${perFrame === encMs ? 'encoder-bound' : 'rasteriser-bound'}`);
-  log(`${frames} frames ≈ ${fmt(frames * perFrame / 1000)} to render`, 'ok');
+  /* The encoder benchmark alone has under-read the runtime twice. Time the
+     real loop and project from that. */
+  setProg(0, 'Timing the real loop…');
+  const tr = await trialRun(best, bitrate, fps, 24);
+  if (tr) {
+    log(`Trial run — ${tr.msPerFrame.toFixed(0)}ms/frame over ${tr.frames} frames`, 'hd');
+    logPhases(tr);
+    log(`${frames} frames ≈ ${fmt(frames * tr.msPerFrame / 1000)} to render`, 'ok');
+    const enc = S.encBench.filter(r => r.ok).find(r => r.p.id === best.id);
+    if (enc && tr.wait < tr.msPerFrame * 0.1) {
+      log(`The encoder is idle ${Math.round(100 - tr.wait / tr.msPerFrame * 100)}% of the time — the frame pipeline sets the pace, not the codec.`);
+    }
+  } else {
+    log('Trial run did not complete — no runtime estimate.', 'warn');
+  }
 
   if (!window.showSaveFilePicker) log('No File System Access API — output must buffer in RAM. Use Chrome or Edge.', 'warn');
   setProg(0, 'Inspect done');
@@ -4020,16 +4135,24 @@ function decodeToCanvas(svg, ctx) {
 }
 
 /* mode 'fast' = visible groups + subset fonts. mode 'shell' = the shell's own
-   serializeFrame(), byte for byte what its EXPORT button would have produced. */
-async function rasterAt(t, ctx, opacity, mode) {
+   serializeFrame(), byte for byte what its EXPORT button would have produced.
+
+   composeFrame() is the synchronous half: paint the shell at t, then snapshot
+   it to a string. decodeToCanvas() is the asynchronous half. They are split so
+   the render loop can decode frame n+1 while frame n is being encoded — the
+   snapshot is a string, so a later paint() cannot disturb a decode in flight. */
+function composeFrame(t, opacity, mode) {
   S.win.paint(t);
   if (mode === 'shell') {
     S.live.style.opacity = opacity;
-    await decodeToCanvas(S.win.serializeFrame(), ctx);
-  } else {
-    S.live.style.opacity = 1;
-    await decodeToCanvas(buildFrameSVG(opacity), ctx);
+    return S.win.serializeFrame();
   }
+  S.live.style.opacity = 1;
+  return buildFrameSVG(opacity);
+}
+
+async function rasterAt(t, ctx, opacity, mode) {
+  await decodeToCanvas(composeFrame(t, opacity, mode), ctx);
 }
 
 /* Compare the fast path against the shell's own output on sample frames. Any
@@ -4059,30 +4182,48 @@ async function runParity(samples) {
 
 /* The shell's own curve, reimplemented here because calling across the frame
    once per audio sample would cost tens of millions of boundary crossings.
-   verifyEnvelope() checks the two agree before it is trusted. */
+   verifyEnvelope() checks the two agree before it is trusted.
+
+   The shell's envelope is symmetric — one duration governs both the dip into a
+   boundary and the recovery out of it. This one takes the two separately, so a
+   1s fade-in and a 0.3s fade-out are expressible. When they are equal the
+   result is identical to the shell's, which is what verifyEnvelope() tests. */
 function makeEnvelope(CHAPTERS, TOTAL) {
-  return function (t, fade) {
-    if (!(fade > 0)) return 1;
+  return function (t, fadeIn, fadeOut) {
+    if (fadeOut === undefined) fadeOut = fadeIn;
+    if (!(fadeIn > 0) && !(fadeOut > 0)) return 1;
     let e = 1;
     for (const c of CHAPTERS) {
       if (c.start <= 0) continue;
-      const d = Math.abs(t - c.start);
-      if (d < fade) e = Math.min(e, d / fade);
+      if (t < c.start) {
+        /* running out of the previous chapter */
+        if (fadeOut > 0 && c.start - t < fadeOut) e = Math.min(e, (c.start - t) / fadeOut);
+      } else {
+        /* opening the new one */
+        if (fadeIn > 0 && t - c.start < fadeIn) e = Math.min(e, (t - c.start) / fadeIn);
+      }
     }
-    if (t < fade) e = Math.min(e, t / fade);
-    if (TOTAL - t < fade) e = Math.min(e, (TOTAL - t) / fade);
+    if (fadeIn > 0 && t < fadeIn) e = Math.min(e, t / fadeIn);
+    if (fadeOut > 0 && TOTAL - t < fadeOut) e = Math.min(e, (TOTAL - t) / fadeOut);
     return Math.max(0, e);
   };
 }
 
-function verifyEnvelope(local) {
+/* Only meaningful for the symmetric case — the shell has no way to express
+   anything else, so an asymmetric setting is reported as a divergence from the
+   preview rather than as a fault in either implementation. */
+function verifyEnvelope(local, fadeIn, fadeOut) {
   if (typeof S.win.envelope !== 'function') return { ok: false, why: 'shell has no envelope()' };
+  if (fadeIn !== fadeOut) {
+    return { ok: false, asym: true,
+             why: `in ${fadeIn}s / out ${fadeOut}s — the shell's preview is symmetric and cannot show this` };
+  }
   const B = bridge();
   let worst = 0;
   for (let i = 0; i <= 400; i++) {
     const t = B.TOTAL * i / 400;
     for (const f of [0.45, 0.2, 1.0]) {
-      worst = Math.max(worst, Math.abs(local(t, f) - S.win.envelope(t, f)));
+      worst = Math.max(worst, Math.abs(local(t, f, f) - S.win.envelope(t, f)));
     }
   }
   return { ok: worst < 1e-9, worst };
@@ -4101,7 +4242,7 @@ async function decodeAudio(file) {
    padded with silence to the full picture length. This replaces the ffmpeg
    -af string the shell used to hand over, and comes from the same curve
    rather than a second implementation that can drift from it. */
-function buildAudio(srcBuf, TOTAL, audioDur, env, fadeA, gain) {
+function buildAudio(srcBuf, TOTAL, audioDur, env, duckIn, duckOut, gain) {
   const sr = srcBuf.sampleRate;
   const chs = Math.min(2, srcBuf.numberOfChannels);
   const outLen = Math.ceil(TOTAL * sr);
@@ -4114,10 +4255,10 @@ function buildAudio(srcBuf, TOTAL, audioDur, env, fadeA, gain) {
     const dst = out[c];
     for (let i = 0; i < n; i++) {
       const t = i / sr;
-      let g = env(t, fadeA);
+      let g = env(t, duckIn, duckOut);
       /* envelope() tapers at TOTAL, but the audio stops at audioDur; without
          this the mix would end abruptly under the outro card. */
-      if (fadeA > 0 && fadeEnd - t < fadeA) g = Math.min(g, Math.max(0, (fadeEnd - t) / fadeA));
+      if (duckOut > 0 && fadeEnd - t < duckOut) g = Math.min(g, Math.max(0, (fadeEnd - t) / duckOut));
       dst[i] = src[i] * g * gain;
     }
   }
@@ -4139,8 +4280,10 @@ async function render() {
     const CHAPTERS = B.CHAPTERS;
     const fps = +$('fps').value;
     const bitrate = +$('br').value;
-    const fadeV = $('pfade').checked ? (B.FADE_V != null ? B.FADE_V : 0.45) : 0;
-    const fadeA = $('afade').checked ? (B.FADE_A != null ? B.FADE_A : 0.45) : 0;
+    const fadeVIn  = $('pfade').checked ? Math.max(0, +$('vin').value)  : 0;
+    const fadeVOut = $('pfade').checked ? Math.max(0, +$('vout').value) : 0;
+    const duckIn   = $('afade').checked ? Math.max(0, +$('ain').value)  : 0;
+    const duckOut  = $('afade').checked ? Math.max(0, +$('aout').value) : 0;
 
     const caps = await probeCodecs(bitrate);
     const want = $('fmtsel').value;
@@ -4165,9 +4308,11 @@ async function render() {
     if (pick.err) throw new Error(pick.err);
 
     const env = makeEnvelope(CHAPTERS, TOTAL);
-    const chk = verifyEnvelope(env);
+    const chk = verifyEnvelope(env, fadeVIn, fadeVOut);
     if (chk.ok) log('Fade curve matches the shell exactly', 'ok');
+    else if (chk.asym) log(`Fade is asymmetric — ${chk.why}. The master is the reference for how it looks; the preview only for when it happens.`, 'warn');
     else log(`Fade curve differs from the shell (max ${chk.worst}) — ${chk.why || 'using local curve'}`, 'warn');
+    log(`Picture fade in ${fadeVIn}s / out ${fadeVOut}s · audio duck in ${duckIn}s / out ${duckOut}s`);
 
     const wantAudio = !!S.audioBuf;
     if (wantAudio && !pick.audioOk) log(`No ${pick.ashort} encoder — writing video only`, 'warn');
@@ -4176,10 +4321,15 @@ async function render() {
     const totalFrames = Math.round(TOTAL * fps);
     log(`Writing .${pick.ext} · ${pick.vshort}${withAudio ? ' + ' + pick.ashort : ''} · ${totalFrames} frames @ ${fps}fps · ${(bitrate / 1e6).toFixed(0)} Mbps`);
 
-    const benchBest = S.encBench && S.encBench.filter(r => r.ok).find(r => r.p.id === profile.id);
-    const rasterMs = par0.ok ? par0.fastMs : par0.shellMs;
-    const encMs = benchBest ? 1000 / benchBest.fps : rasterMs;
-    log(`Estimated ${fmt(totalFrames * Math.max(rasterMs, encMs) / 1000)} of rendering`);
+    setProg(0, 'Timing the real loop\u2026');
+    const tr = await trialRun(profile, bitrate, fps, 24);
+    if (tr) {
+      log(`Trial run \u2014 ${tr.msPerFrame.toFixed(0)}ms/frame over ${tr.frames} frames`, 'hd');
+      logPhases(tr);
+      log(`At least ${fmt(totalFrames * tr.msPerFrame / 1000)} of rendering \u00b7 not before ~${clockAt(totalFrames * tr.msPerFrame / 1000)}`, 'ok');
+    } else {
+      log('Trial run did not complete \u2014 proceeding without an estimate.', 'warn');
+    }
 
     /* An hour of 1080p at 16 Mbps is over a gigabyte. Held in an
        ArrayBuffer that gets the tab killed, so stream it to disk. */
@@ -4243,7 +4393,7 @@ async function render() {
     if (withAudio) {
       setProg(0, 'Encoding audio…');
       const audioDur = (typeof B.EPISODE.audioDur === 'number') ? B.EPISODE.audioDur : TOTAL;
-      const track = buildAudio(S.audioBuf, TOTAL, audioDur, env, fadeA, +$('vol').value / 100);
+      const track = buildAudio(S.audioBuf, TOTAL, audioDur, env, duckIn, duckOut, +$('vol').value / 100);
       const aenc = new AudioEncoder({
         output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
         error: e => { encErr = e; },
@@ -4274,39 +4424,62 @@ async function render() {
     }
 
     /* ---- video ---------------------------------------------------------- */
-    const cv = document.createElement('canvas'); cv.width = 1920; cv.height = 1080;
-    const cx = cv.getContext('2d', { alpha: false });
+    /* Two canvases: frame n is handed to the encoder while frame n+1 decodes
+       into the other one. composeFrame() snapshots the shell to a string, so
+       painting n+1 cannot disturb a decode of n already in flight. */
+    const cvs = [0, 1].map(() => { const c = document.createElement('canvas'); c.width = 1920; c.height = 1080; return c; });
+    const ctxs = cvs.map(c => c.getContext('2d', { alpha: false }));
     const gopSize = fps * 2;
     const usPerFrame = 1e6 / fps;
-    let waitMs = 0;
+    let waitMs = 0, composeMs = 0, decodeMs = 0, frameMs = 0;
+
+    const opacityAt = t => (fadeVIn > 0 || fadeVOut > 0) ? (0.06 + 0.94 * env(t, fadeVIn, fadeVOut)) : 1;
+
+    let s0 = performance.now();
+    let pendSvg = composeFrame(0, opacityAt(0), S.mode);
+    composeMs += performance.now() - s0;
+    let pending = decodeToCanvas(pendSvg, ctxs[0]);
+    let cur = 0;
 
     for (let f = 0; f < totalFrames; f++) {
       if (S.cancel) throw new Error('cancelled');
       if (encErr) throw encErr;
-      const t = f / fps;
-      const op = fadeV > 0 ? (0.06 + 0.94 * env(t, fadeV)) : 1;
-      await rasterAt(t, cx, op, S.mode);
+
+      s0 = performance.now(); await pending; decodeMs += performance.now() - s0;
+
+      let nextPending = null;
+      if (f + 1 < totalFrames) {
+        const tn = (f + 1) / fps;
+        s0 = performance.now();
+        const nsvg = composeFrame(tn, opacityAt(tn), S.mode);
+        composeMs += performance.now() - s0;
+        nextPending = decodeToCanvas(nsvg, ctxs[1 - cur]);
+      }
 
       /* The whole point: the timestamp is computed, not observed. A frame that
          took 800ms to draw is still stamped at exactly f/fps. */
-      const vf = new VideoFrame(cv, {
+      s0 = performance.now();
+      const vf = new VideoFrame(cvs[cur], {
         timestamp: Math.round(f * usPerFrame),
         duration: Math.round(usPerFrame),
       });
       venc.encode(vf, { keyFrame: f % gopSize === 0 });
       vf.close();
+      frameMs += performance.now() - s0;
 
       if (venc.encodeQueueSize > QUEUE_HIGH) {
         const w0 = performance.now();
         while (venc.encodeQueueSize > QUEUE_LOW) await new Promise(r => setTimeout(r, 2));
         waitMs += performance.now() - w0;
       }
+      pending = nextPending; cur = 1 - cur;
+
       if (f % 10 === 0 || f === totalFrames - 1) {
         const el = (performance.now() - started) / 1000;
         const per = el / (f + 1);
         const left = (totalFrames - f - 1) * per;
-        const stall = Math.round(waitMs / (el * 1000) * 100);
-        setProg(f / totalFrames, `frame ${f + 1}/${totalFrames} · ${(per * 1000).toFixed(0)}ms/frame · ${stall}% waiting on encoder · ${fmt(left)} left`);
+        setProg(f / totalFrames,
+          `frame ${f + 1}/${totalFrames} \u00b7 ${(per * 1000).toFixed(0)}ms/frame \u00b7 ${fmt(el)} elapsed \u00b7 ${fmt(left)} left \u00b7 done ~${clockAt(left)}`);
         await new Promise(r => setTimeout(r, 0));
       }
     }
@@ -4320,11 +4493,12 @@ async function render() {
     if (fileStream) {
       await fileStream.close();
       log(`Done — written to ${base} in ${mins.toFixed(1)} min`, 'ok');
-      log(`${(mins * 60000 / totalFrames).toFixed(0)}ms/frame · ${Math.round(waitMs / (mins * 600))}% of it waiting on the encoder`);
+      logRenderPhases(mins, totalFrames, composeMs, decodeMs, frameMs, waitMs);
     } else {
       const blob = new Blob([target.buffer], { type: pick.container === 'mp4' ? 'video/mp4' : 'video/webm' });
       download(blob, base);
       log(`Done — ${(blob.size / 1048576).toFixed(1)} MB in ${mins.toFixed(1)} min`, 'ok');
+      logRenderPhases(mins, totalFrames, composeMs, decodeMs, frameMs, waitMs);
     }
     setProg(1, 'Done');
   } catch (e) {

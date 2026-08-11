@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- @mpd-version render-web 3 -->
+<!-- @mpd-version render-web 4 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -140,9 +140,19 @@
       <div class="note">Chrome will not say whether a hardware encoder exists — the flag
         is a hint, never a guarantee. Inspect measures each one instead.</div>
       <label class="chk"><input type="checkbox" id="pfade" checked>
-        <span>Picture fade at chapters<small>Matches the preview dip. The old MediaRecorder export never applied it.</small></span></label>
-      <label class="chk"><input type="checkbox" id="afade" checked>
-        <span>Audio duck at chapters<small>Same curve as the picture fade — replaces the ffmpeg -af string.</small></span></label>
+        <span>Picture fade at chapters<small>Fades out into each chapter boundary and back in after it.</small></span></label>
+      <div class="two">
+        <div><label>Fade in (s)</label><input type="number" id="vin" min="0" max="5" step="0.05" value="1.0"></div>
+        <div><label>Fade out (s)</label><input type="number" id="vout" min="0" max="5" step="0.05" value="1.0"></div>
+      </div>
+      <label class="chk" style="margin-top:14px"><input type="checkbox" id="afade" checked>
+        <span>Audio duck at chapters<small>Same shape as the picture fade, applied as gain. Replaces the ffmpeg -af string.</small></span></label>
+      <div class="two">
+        <div><label>Duck in (s)</label><input type="number" id="ain" min="0" max="5" step="0.05" value="1.0"></div>
+        <div><label>Duck out (s)</label><input type="number" id="aout" min="0" max="5" step="0.05" value="1.0"></div>
+      </div>
+      <div class="note">The shell's preview uses one symmetric duration, so unequal
+        in/out values will look different there. The master is the reference.</div>
     </fieldset>
 
     <fieldset>
