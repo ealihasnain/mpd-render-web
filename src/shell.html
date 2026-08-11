@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- @mpd-version render-web 6 -->
+<!-- @mpd-version render-web 8 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -125,6 +125,8 @@
          border:1px solid var(--ink);background:var(--canvas);color:var(--ink);cursor:pointer}
   .chbtn:hover{background:var(--ink);color:var(--canvas)}
   .chbtn.on{background:var(--teal-deep);border-color:var(--teal-deep);color:var(--canvas)}
+  .chbtn.seg{border-style:dashed;font-weight:700}
+  .chbtn.seg:disabled{opacity:.3;cursor:default;background:var(--canvas);color:var(--ink)}
   .tp-hint{font:400 11px/1.5 var(--font-body);color:var(--ink-soft);margin-top:7px}
 </style>
 </head>
@@ -143,8 +145,13 @@
       <input type="file" id="fHtml" accept=".html,text/html">
       <label>Voice mix (optional)</label>
       <input type="file" id="fAudio" accept="audio/*">
+      <label>Intro (optional)</label>
+      <input type="file" id="fIntro" accept="video/*,audio/*">
+      <label>Outro (optional)</label>
+      <input type="file" id="fOutro" accept="video/*,audio/*">
       <div class="note">The timeline, chapters and beats are read from the HTML.
-        No episode.json needed.</div>
+        No episode.json needed. Intro and outro may carry video, audio or both;
+        an audio-only file holds the adjacent episode frame underneath it.</div>
     </fieldset>
 
     <fieldset>
@@ -200,6 +207,7 @@
     <button class="btn warn" id="bSheets" disabled>Contact sheets</button>
     <button class="btn primary" id="bRender" disabled>Render master</button>
     <button class="btn warn" id="bCancel" disabled>■ Stop render</button>
+    <button class="btn" id="bOpen" style="display:none">▶ Open result</button>
     <div class="note">Chrome asks where to save before rendering starts, then
       writes as it goes. Keep the tab focused — a background tab is throttled.</div>
   </div>
@@ -225,7 +233,9 @@
         </select>
         <input type="range" id="pvVol" min="0" max="100" value="100" title="volume">
         <span class="tp-div"></span>
+        <button class="chbtn seg" id="pvGoIntro" title="jump to intro" disabled>I</button>
         <span id="pvChaps"></span>
+        <button class="chbtn seg" id="pvGoOutro" title="jump to outro" disabled>O</button>
         <span class="tp-time" id="pvTime">0:00 / 0:00</span>
       </div>
       <div id="pvScrubWrap"><div id="pvScrub"><div id="pvScrubFill"></div></div></div>

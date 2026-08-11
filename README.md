@@ -1,4 +1,4 @@
-# mpd-render-web 6
+# mpd-render-web 8
 
 Deterministic master render for MoneyPatternsDecoded video shells. Runs entirely
 in the browser — no Python, no admin rights, no install, nothing uploaded.
@@ -111,6 +111,71 @@ length while the picture stops early.
 
 Stop is also checked inside the encoder-queue wait, so it takes effect
 immediately rather than after the queue drains.
+
+### Intro and outro
+
+Two optional attachments splice whole media files onto either end of the
+episode. Either may carry video, audio or both — an MP3 sting and a branded
+WebM card are equally valid. The assembled timeline is
+`intro + episode + outro`; chapter starts, the scrub bar, the chapter buttons
+and the runtime estimate all re-base onto it, and `I` / `O` buttons flank the
+chapter row in the transport.
+
+**Joins fade exactly like chapter boundaries** — same envelope, same four
+duration fields. A special-cased join would mean two fade behaviours to reason
+about instead of one. Verified on a spliced render: audio RMS falls to ~0.002
+at both joins and recovers, and the picture dips with it.
+
+**Frames come from seeking, not playing.** A `<video>` element is seeked frame
+by frame and drawn to the canvas. Playing it would reintroduce exactly the
+wall-clock dependency that made MediaRecorder produce a 53-minute file. This
+app has muxers but no demuxers, and vendoring mp4box.js to decode a
+five-second sting is a poor trade — seeking works for any container Chrome can
+already play, which is the same set you are choosing from. A seek past the last
+keyframe can fail to fire, so it times out at 900ms and uses the frame it has
+rather than stalling the render.
+
+Attachments are letterboxed onto the brand canvas rather than stretched, so a
+differently-shaped intro keeps its aspect. An audio-only attachment holds the
+adjacent episode frame underneath it, so the screen is never blank under a
+sting.
+
+Audio is decoded at the mix's own sample rate — `decodeAudioData` resamples, so
+a 44.1k intro and a 48k mix land on one grid without a resampler here. Mixing
+rates by hand is how pitch bugs get shipped. Parts are summed and clamped, since
+a hot mix plus a hot sting can exceed unity even though the parts never overlap.
+
+### Preview audio preserves pitch
+
+Preview audio plays through an `<audio>` element, not an
+`AudioBufferSourceNode`. A buffer source's `playbackRate` resamples, so 2x
+playback lifts the voice an octave and the narration turns comical — useless for
+judging whether a beat lands on the right word. `HTMLMediaElement` has
+`preservesPitch`, which time-stretches instead, so pitch holds at every speed
+from 0.5x to 8x. It is also a better clock: `currentTime` is the decoder's own
+position rather than arithmetic layered on top of one.
+
+A rate change now applies in place with no restart and no gap; the buffer-source
+version had to tear the node down and re-seek. The element is routed through the
+same gain node, so the duck preview is unaffected.
+
+### Opening the result
+
+**Open result** appears when a render finishes or is stopped, and hands the file
+to a new tab where Chrome plays H.264/AAC and VP9/Opus natively. Reading it back
+through `getFile()` yields a File backed by disk, so opening a gigabyte master
+does not pull a gigabyte into memory.
+
+It cannot launch VLC. Starting a local application from a browser tab is a
+security boundary with no workaround. For that, the file is already saved where
+the picker put it.
+
+### Unload guard
+
+A render is minutes of unresumable work and a stray Ctrl+R discards it silently,
+so the page asks for confirmation before unloading while a render is running or
+an episode is loaded. The browser supplies its own wording; a page can only
+request the prompt.
 
 ### Preview transport
 

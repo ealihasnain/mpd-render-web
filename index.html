@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- @mpd-version render-web 6 -->
+<!-- @mpd-version render-web 8 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -125,6 +125,8 @@
          border:1px solid var(--ink);background:var(--canvas);color:var(--ink);cursor:pointer}
   .chbtn:hover{background:var(--ink);color:var(--canvas)}
   .chbtn.on{background:var(--teal-deep);border-color:var(--teal-deep);color:var(--canvas)}
+  .chbtn.seg{border-style:dashed;font-weight:700}
+  .chbtn.seg:disabled{opacity:.3;cursor:default;background:var(--canvas);color:var(--ink)}
   .tp-hint{font:400 11px/1.5 var(--font-body);color:var(--ink-soft);margin-top:7px}
 </style>
 </head>
@@ -143,8 +145,13 @@
       <input type="file" id="fHtml" accept=".html,text/html">
       <label>Voice mix (optional)</label>
       <input type="file" id="fAudio" accept="audio/*">
+      <label>Intro (optional)</label>
+      <input type="file" id="fIntro" accept="video/*,audio/*">
+      <label>Outro (optional)</label>
+      <input type="file" id="fOutro" accept="video/*,audio/*">
       <div class="note">The timeline, chapters and beats are read from the HTML.
-        No episode.json needed.</div>
+        No episode.json needed. Intro and outro may carry video, audio or both;
+        an audio-only file holds the adjacent episode frame underneath it.</div>
     </fieldset>
 
     <fieldset>
@@ -200,6 +207,7 @@
     <button class="btn warn" id="bSheets" disabled>Contact sheets</button>
     <button class="btn primary" id="bRender" disabled>Render master</button>
     <button class="btn warn" id="bCancel" disabled>■ Stop render</button>
+    <button class="btn" id="bOpen" style="display:none">▶ Open result</button>
     <div class="note">Chrome asks where to save before rendering starts, then
       writes as it goes. Keep the tab focused — a background tab is throttled.</div>
   </div>
@@ -225,7 +233,9 @@
         </select>
         <input type="range" id="pvVol" min="0" max="100" value="100" title="volume">
         <span class="tp-div"></span>
+        <button class="chbtn seg" id="pvGoIntro" title="jump to intro" disabled>I</button>
         <span id="pvChaps"></span>
+        <button class="chbtn seg" id="pvGoOutro" title="jump to outro" disabled>O</button>
         <span class="tp-time" id="pvTime">0:00 / 0:00</span>
       </div>
       <div id="pvScrubWrap"><div id="pvScrub"><div id="pvScrubFill"></div></div></div>
@@ -3621,7 +3631,7 @@ ${notes}`;
 })();
 if (typeof module === "object" && typeof module.exports === "object") Object.assign(module.exports, WebMMuxer)
 </script>
-<script>/* @mpd-version render-web 6
+<script>/* @mpd-version render-web 8
    mpd-render-web — deterministic browser render for MPD video shells.
 
    The shell's export loop was already deterministic: it paints from a frame
@@ -3648,7 +3658,7 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
 const $ = id => document.getElementById(id);
 const S = {
   win: null, doc: null, live: null, html: null,
-  audioBuf: null, audioName: '', htmlName: '',
+  audioBuf: null, audioName: '', htmlName: '', audioFile: null, outHandle: null, outBlob: null,
   cancel: false, running: false, fontCss: '', faces: null, mode: 'fast', wake: null,
   encBench: null,      // [{p, ok, fps, ...}] from the last benchEncoders() run
   encBenchKey: '',     // bitrate|fps the bench was measured at — invalidates on change
@@ -3933,12 +3943,11 @@ async function trialRun(profile, bitrate, fps, frames) {
 
   /* Sample across the timeline rather than the first second, which on most
      episodes is a title card and not representative of anything. */
-  const at = i => B.TOTAL * (i + 0.5) / frames;
+  const at = i => segs().grand * (i + 0.5) / frames;
 
   let s = performance.now();
-  let svg = composeFrame(at(0), 1, S.mode);
+  let pending = drawTimelineFrame(at(0), ctxs[0], 1, S.mode);
   T.compose += performance.now() - s;
-  let pending = decodeToCanvas(svg, ctxs[0]);
   let cur = 0;
 
   const t0 = performance.now();
@@ -3948,9 +3957,8 @@ async function trialRun(profile, bitrate, fps, frames) {
     let nextPending = null;
     if (f + 1 < frames) {
       s = performance.now();
-      const nsvg = composeFrame(at(f + 1), 1, S.mode);
+      nextPending = drawTimelineFrame(at(f + 1), ctxs[1 - cur], 1, S.mode);
       T.compose += performance.now() - s;
-      nextPending = decodeToCanvas(nsvg, ctxs[1 - cur]);
     }
 
     s = performance.now();
@@ -4243,30 +4251,52 @@ async function runParity(samples) {
    once per audio sample would cost tens of millions of boundary crossings.
    verifyEnvelope() checks the two agree before it is trusted.
 
-   The shell's envelope is symmetric — one duration governs both the dip into a
-   boundary and the recovery out of it. This one takes the two separately, so a
-   1s fade-in and a 0.3s fade-out are expressible. When they are equal the
-   result is identical to the shell's, which is what verifyEnvelope() tests. */
-function makeEnvelope(CHAPTERS, TOTAL) {
+   Boundaries are passed in rather than read from CHAPTERS, because with an
+   intro or outro attached the fade points are the shifted chapter starts plus
+   the two joins. A join is treated as exactly a chapter boundary — same curve,
+   same four duration fields. Special-casing it would mean two fade behaviours
+   to reason about instead of one.
+
+   The shell's envelope is symmetric: one duration governs both the dip into a
+   boundary and the recovery out of it. This takes the two separately, so a 1s
+   fade-in and a 0.3s fade-out are expressible. Equal values reproduce the
+   shell exactly, which is what verifyEnvelope() tests. */
+function makeEnvelopeB(bounds, total) {
   return function (t, fadeIn, fadeOut) {
     if (fadeOut === undefined) fadeOut = fadeIn;
     if (!(fadeIn > 0) && !(fadeOut > 0)) return 1;
     let e = 1;
-    for (const c of CHAPTERS) {
-      if (c.start <= 0) continue;
-      if (t < c.start) {
-        /* running out of the previous chapter */
-        if (fadeOut > 0 && c.start - t < fadeOut) e = Math.min(e, (c.start - t) / fadeOut);
+    for (const bd of bounds) {
+      if (bd <= 0 || bd >= total) continue;
+      if (t < bd) {
+        if (fadeOut > 0 && bd - t < fadeOut) e = Math.min(e, (bd - t) / fadeOut);
       } else {
-        /* opening the new one */
-        if (fadeIn > 0 && t - c.start < fadeIn) e = Math.min(e, (t - c.start) / fadeIn);
+        if (fadeIn > 0 && t - bd < fadeIn) e = Math.min(e, (t - bd) / fadeIn);
       }
     }
     if (fadeIn > 0 && t < fadeIn) e = Math.min(e, t / fadeIn);
-    if (fadeOut > 0 && TOTAL - t < fadeOut) e = Math.min(e, (TOTAL - t) / fadeOut);
+    if (fadeOut > 0 && total - t < fadeOut) e = Math.min(e, (total - t) / fadeOut);
     return Math.max(0, e);
   };
 }
+
+function makeEnvelope(CHAPTERS, TOTAL) {
+  return makeEnvelopeB((CHAPTERS || []).map(c => c.start), TOTAL);
+}
+
+/* Every fade point on the assembled timeline: chapter starts pushed right by
+   the intro, plus the intro->episode and episode->outro joins. */
+function timelineBounds() {
+  const g = segs();
+  const out = (bridgeChapters()).map(c => c.start + g.i);
+  if (g.i > 0) out.push(g.i);
+  if (g.o > 0) out.push(g.i + g.ep);
+  /* Chapter 1 starts exactly at the intro join, so without this the same
+     boundary is applied twice. Harmless to the maths, confusing in a log. */
+  return [...new Set(out.map(x => Math.round(x * 1e6) / 1e6))].sort((a, b) => a - b);
+}
+
+function makeTimelineEnvelope() { return makeEnvelopeB(timelineBounds(), segs().grand); }
 
 /* Only meaningful for the symmetric case — the shell has no way to express
    anything else, so an asymmetric setting is reported as a divergence from the
@@ -4301,25 +4331,51 @@ async function decodeAudio(file) {
    padded with silence to the full picture length. This replaces the ffmpeg
    -af string the shell used to hand over, and comes from the same curve
    rather than a second implementation that can drift from it. */
-function buildAudio(srcBuf, TOTAL, audioDur, env, duckIn, duckOut, gain) {
-  const sr = srcBuf.sampleRate;
-  const chs = Math.min(2, srcBuf.numberOfChannels);
-  const outLen = Math.ceil(TOTAL * sr);
+/* Decode at a chosen sample rate. Chrome resamples inside decodeAudioData, so
+   an intro at 44.1k and a mix at 48k land on one grid without a resampler
+   here. Mixing rates by hand is how pitch bugs get shipped. */
+async function decodeAudioAt(file, sampleRate) {
+  const ac = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sampleRate });
+  try { return await ac.decodeAudioData(await file.arrayBuffer()); }
+  finally { try { await ac.close(); } catch (e) {} }
+}
+
+/* Builds the ducked track for the whole assembled timeline: intro, episode and
+   outro laid onto one buffer, with the shell's chapter envelope applied as
+   gain across all of it. This replaces the ffmpeg -af string the shell used to
+   hand over, and comes from the same curve the picture uses rather than a
+   second implementation that can drift from it.
+
+   parts: [{ buf, at, tail }] — tail is where that part's own audio stops, if
+   it stops before its slot ends (an episode whose mix ends under an outro
+   card). Everything else is governed by the shared envelope. */
+function buildAudioParts(parts, grand, env, duckIn, duckOut, gain, sr) {
+  const chs = parts.reduce((m, p) => Math.max(m, Math.min(2, p.buf.numberOfChannels)), 1);
+  const outLen = Math.ceil(grand * sr);
   const out = [];
   for (let c = 0; c < chs; c++) out.push(new Float32Array(outLen));
-  const fadeEnd = Math.min(audioDur, TOTAL);
-  for (let c = 0; c < chs; c++) {
-    const src = srcBuf.getChannelData(c);
-    const n = Math.min(src.length, outLen);
-    const dst = out[c];
-    for (let i = 0; i < n; i++) {
-      const t = i / sr;
-      let g = env(t, duckIn, duckOut);
-      /* envelope() tapers at TOTAL, but the audio stops at audioDur; without
-         this the mix would end abruptly under the outro card. */
-      if (duckOut > 0 && fadeEnd - t < duckOut) g = Math.min(g, Math.max(0, (fadeEnd - t) / duckOut));
-      dst[i] = src[i] * g * gain;
+
+  for (const part of parts) {
+    const off = Math.round(part.at * sr);
+    const n = Math.min(part.buf.length, outLen - off);
+    for (let c = 0; c < chs; c++) {
+      const src = part.buf.getChannelData(Math.min(c, part.buf.numberOfChannels - 1));
+      const dst = out[c];
+      for (let i = 0; i < n; i++) {
+        const t = (off + i) / sr;
+        let g = env(t, duckIn, duckOut);
+        if (part.tail != null && duckOut > 0 && part.tail - t < duckOut) {
+          g = Math.min(g, Math.max(0, (part.tail - t) / duckOut));
+        }
+        dst[off + i] += src[i] * g * gain;
+      }
     }
+  }
+  /* Parts never overlap, so summing cannot clip on its own — but a hot mix
+     plus a hot sting can still exceed unity, so clamp rather than wrap. */
+  for (let c = 0; c < chs; c++) {
+    const d = out[c];
+    for (let i = 0; i < d.length; i++) { if (d[i] > 1) d[i] = 1; else if (d[i] < -1) d[i] = -1; }
   }
   return { channels: out, sampleRate: sr, numberOfChannels: chs, length: outLen };
 }
@@ -4344,10 +4400,11 @@ const PV = {
   ctx: null, src: null, gain: null, raf: null,
   anchorT: 0, anchorCtx: 0, anchorWall: 0,
   cx: null, busy: false, painted: 0, drops: 0, shown: 0,
+  el: null, elSrc: null, elUrl: '', seg: 'ep',
 };
 
-function pvTotal() { try { return bridge().TOTAL; } catch (e) { return 0; } }
-function pvChapters() { try { return bridge().CHAPTERS || []; } catch (e) { return []; } }
+function pvTotal() { return segs().grand; }
+function pvChapters() { return bridgeChapters(); }
 
 function pvFades() {
   return {
@@ -4359,7 +4416,7 @@ function pvFades() {
 }
 
 function pvEnv() {
-  if (!PV._env) PV._env = makeEnvelope(pvChapters(), pvTotal());
+  if (!PV._env) PV._env = makeTimelineEnvelope();
   return PV._env;
 }
 
@@ -4372,24 +4429,74 @@ function pvAudioCtx() {
   return PV.ctx;
 }
 
-function pvStartAudio() {
-  if (!S.audioBuf) return;
-  pvStopAudio();
+/* Preview audio runs through an <audio> element rather than an
+   AudioBufferSourceNode. A buffer source's playbackRate resamples, so 2x
+   playback lifts the voice an octave and KateAsta turns into a chipmunk —
+   useless for judging whether a beat lands on the right word. HTMLMediaElement
+   has preservesPitch, which time-stretches instead, so the pitch holds at every
+   speed. It is also a better clock: currentTime is the decoder's own position,
+   not arithmetic layered on top of it.
+
+   createMediaElementSource may only be called once per element, so the element
+   and its graph are built when the file loads and reused for the session. */
+function pvAttachAudio(file) {
+  pvDetachAudio();
   const ctx = pvAudioCtx();
-  if (ctx.state === 'suspended') ctx.resume();
-  if (PV.t >= S.audioBuf.duration) return;   // past the narration; picture only
-  const src = ctx.createBufferSource();
-  src.buffer = S.audioBuf;
-  src.playbackRate.value = PV.speed;
-  src.connect(PV.gain);
-  src.start(0, PV.t);
-  PV.src = src;
-  PV.anchorT = PV.t;
-  PV.anchorCtx = ctx.currentTime;
+  PV.elUrl = URL.createObjectURL(file);
+  const el = new Audio();
+  el.src = PV.elUrl;
+  el.preload = 'auto';
+  el.preservesPitch = true;
+  el.mozPreservesPitch = true;
+  el.webkitPreservesPitch = true;
+  PV.el = el;
+  try {
+    PV.elSrc = ctx.createMediaElementSource(el);
+    PV.elSrc.connect(PV.gain);
+  } catch (e) {
+    log('Could not route preview audio through the gain node — duck preview disabled.', 'warn');
+    PV.elSrc = null;
+  }
+}
+
+function pvDetachAudio() {
+  if (PV.el) { try { PV.el.pause(); } catch (e) {} }
+  if (PV.elSrc) { try { PV.elSrc.disconnect(); } catch (e) {} PV.elSrc = null; }
+  if (PV.elUrl) { URL.revokeObjectURL(PV.elUrl); PV.elUrl = ''; }
+  PV.el = null;
+}
+
+/* Preview audio follows the timeline: the intro's own element while the intro
+   plays, the mix during the episode, the outro's after. Each is already routed
+   through the same gain node, so the duck applies across all three. */
+function pvActive() {
+  const seg = segAt(PV.t);
+  if (seg.kind === 'ep') return PV.el ? { el: PV.el, local: seg.local } : null;
+  return (seg.att && seg.att.el) ? { el: seg.att.el, local: seg.local } : null;
 }
 
 function pvStopAudio() {
-  if (PV.src) { try { PV.src.stop(); } catch (e) {} try { PV.src.disconnect(); } catch (e) {} PV.src = null; }
+  [PV.el, ATT.intro && ATT.intro.el, ATT.outro && ATT.outro.el].forEach(el => {
+    if (el) { try { el.pause(); } catch (e) {} }
+  });
+}
+
+function pvStartAudio() {
+  const ctx = pvAudioCtx();
+  if (ctx.state === 'suspended') ctx.resume();
+  const act = pvActive();
+  /* Pause whatever else was sounding; segments never overlap. */
+  [PV.el, ATT.intro && ATT.intro.el, ATT.outro && ATT.outro.el].forEach(el => {
+    if (el && (!act || el !== act.el)) { try { el.pause(); } catch (e) {} }
+  });
+  if (!act) return;
+  if (act.local >= (act.el.duration || Infinity)) return;   // no audio left in this piece
+  try {
+    act.el.playbackRate = PV.speed;
+    act.el.currentTime = act.local;
+    const pr = act.el.play();
+    if (pr && pr.catch) pr.catch(() => {});
+  } catch (e) {}
 }
 
 function pvPlay() {
@@ -4421,7 +4528,13 @@ function pvGoto(t) {
   const total = pvTotal();
   PV.t = Math.max(0, Math.min(total, t));
   PV.anchorWall = performance.now();
+  PV.seg = segAt(PV.t).kind;
   if (PV.playing) pvStartAudio();
+  else {
+    pvStopAudio();
+    const act = pvActive();
+    if (act) { try { act.el.currentTime = Math.min(act.local, (act.el.duration || 0)); } catch (e) {} }
+  }
   pvPaint();
   pvSyncUI();
 }
@@ -4429,7 +4542,8 @@ function pvGoto(t) {
 function pvSkip(dir) { pvGoto(PV.t + dir * (+$('pvJump').value)); }
 
 function pvChapterStep(dir) {
-  const ch = pvChapters();
+  const g = segs();
+  const ch = pvChapters().map(c => ({ start: c.start + g.i }));
   if (!ch.length) return;
   let idx = 0;
   for (let i = 0; i < ch.length; i++) if (ch[i].start <= PV.t + 1e-3) idx = i;
@@ -4442,7 +4556,11 @@ function pvChapterStep(dir) {
 
 function pvSetSpeed() {
   PV.speed = +$('pvSpeed').value;
-  if (PV.playing) pvStartAudio();   // playbackRate is fixed at start; restart from t
+  /* A media element takes a rate change in place, pitch preserved — no restart,
+     no gap. The buffer-source version had to tear down and re-seek. */
+  [PV.el, ATT.intro && ATT.intro.el, ATT.outro && ATT.outro.el].forEach(el => {
+    if (el) el.playbackRate = PV.speed;
+  });
   PV.anchorWall = performance.now();
 }
 
@@ -4470,8 +4588,7 @@ async function pvDraw() {
   try {
     const f = pvFades();
     const op = (f.vIn > 0 || f.vOut > 0) ? (0.06 + 0.94 * pvEnv()(PV.t, f.vIn, f.vOut)) : 1;
-    const svg = composeFrame(PV.t, op, S.mode);
-    await decodeToCanvas(svg, PV.cx);
+    await drawTimelineFrame(PV.t, PV.cx, op, S.mode);
     PV.painted = PV.t; PV.shown++;
   } catch (e) {
     /* One bad frame should not take playback down with it. */
@@ -4483,8 +4600,14 @@ function pvGain() {
   if (!PV.gain) return;
   const f = pvFades();
   let g = (f.aIn > 0 || f.aOut > 0) ? pvEnv()(PV.t, f.aIn, f.aOut) : 1;
-  const dur = S.audioBuf ? S.audioBuf.duration : 0;
-  if (f.aOut > 0 && dur && dur - PV.t < f.aOut) g = Math.min(g, Math.max(0, (dur - PV.t) / f.aOut));
+  const seg = segAt(PV.t);
+  if (seg.kind === 'ep' && S.audioBuf) {
+    const g0 = segs();
+    const end = g0.i + S.audioBuf.duration;
+    if (f.aOut > 0 && end < g0.i + g0.ep && end - PV.t < f.aOut) {
+      g = Math.min(g, Math.max(0, (end - PV.t) / f.aOut));
+    }
+  }
   PV.gain.gain.value = g * PV.vol;
 }
 
@@ -4493,8 +4616,9 @@ function pvPaint() { pvGain(); pvDraw(); }
 function pvTick() {
   if (!PV.playing) return;
   const total = pvTotal();
-  if (PV.src && PV.ctx) {
-    PV.t = PV.anchorT + (PV.ctx.currentTime - PV.anchorCtx) * PV.speed;
+  const act = pvActive();
+  if (act && !act.el.paused) {
+    PV.t = PV.t - segAt(PV.t).local + act.el.currentTime;
   } else {
     const now = performance.now();
     PV.t += (now - PV.anchorWall) / 1000 * PV.speed;
@@ -4503,7 +4627,12 @@ function pvTick() {
   if (PV.t >= total) { PV.t = total; pvPause(); pvPaint(); pvSyncUI(); return; }
   /* Audio runs out before the picture on episodes with an outro card. Hand the
      clock back to the wall before the source ends, not after. */
-  if (PV.src && S.audioBuf && PV.t >= S.audioBuf.duration - 0.05) {
+  /* Two cases hand the clock back to the wall: an episode whose mix ends under
+     an outro card, and a crossing into a piece with different audio. */
+  const seg2 = segAt(PV.t);
+  if (seg2.kind !== PV.seg) { PV.seg = seg2.kind; PV.anchorWall = performance.now(); pvStartAudio(); }
+  const act2 = pvActive();
+  if (act2 && !act2.el.paused && segAt(PV.t).local >= (act2.el.duration || Infinity) - 0.05) {
     pvStopAudio(); PV.anchorWall = performance.now();
   }
   /* Rasterising costs tens of milliseconds, so at 8x — or on a heavy beat —
@@ -4520,11 +4649,15 @@ function pvSyncUI() {
   $('pvPlay').innerHTML = PV.playing ? '&#10074;&#10074;' : '&#9654;';
   $('pvTime').textContent = fmt(PV.t) + ' / ' + fmt(total);
   $('pvScrubFill').style.width = (total ? PV.t / total * 100 : 0) + '%';
+  const g = segs();
+  const seg = segAt(PV.t);
   const ch = pvChapters();
   let idx = -1;
-  for (let i = 0; i < ch.length; i++) if (ch[i].start <= PV.t + 1e-3) idx = i;
+  if (seg.kind === 'ep') for (let i = 0; i < ch.length; i++) if (ch[i].start <= seg.local + 1e-3) idx = i;
   const btns = $('pvChaps').children;
   for (let i = 0; i < btns.length; i++) btns[i].classList.toggle('on', i === idx);
+  $('pvGoIntro').classList.toggle('on', seg.kind === 'intro');
+  $('pvGoOutro').classList.toggle('on', seg.kind === 'outro');
 }
 
 function pvEnable(on) {
@@ -4538,14 +4671,19 @@ function pvBuild() {
   if (!PV.cx) PV.cx = $('pvCanvas').getContext('2d', { alpha: false });
   const wrap = $('pvChaps');
   wrap.innerHTML = '';
+  const g = segs();
   pvChapters().forEach((c, i) => {
     const b = document.createElement('button');
     b.className = 'chbtn';
     b.textContent = (i + 1);
-    b.title = (c.title || ('Chapter ' + (i + 1))) + ' · ' + fmt(c.start);
-    b.onclick = () => pvGoto(c.start);
+    b.title = (c.title || ('Chapter ' + (i + 1))) + ' · ' + fmt(c.start + g.i);
+    b.onclick = () => pvGoto(c.start + g.i);
     wrap.appendChild(b);
   });
+  $('pvGoIntro').disabled = !ATT.intro;
+  $('pvGoOutro').disabled = !ATT.outro;
+  $('pvGoIntro').title = ATT.intro ? 'intro · ' + fmt(g.i) : 'no intro attached';
+  $('pvGoOutro').title = ATT.outro ? 'outro · ' + fmt(g.o) : 'no outro attached';
   $('pvHint').textContent = S.audioBuf
     ? 'Space plays, ← → skip, ↑ ↓ chapter. Fade and duck fields apply live.'
     : 'Picture only — load a voice mix to preview audio. Space plays, ← → skip, ↑ ↓ chapter.';
@@ -4580,11 +4718,135 @@ function pvWire() {
   });
 }
 
+/* ----------------------------------------------------------- attachments */
+
+/* Intro and outro are whole media files spliced onto either end of the
+   episode. They may carry video, audio, or both — an MP3 sting and a branded
+   WebM card are both valid, and neither is required.
+
+   Frames come out of a <video> element seeked frame by frame rather than
+   played. Playing would reintroduce exactly the wall-clock dependency that
+   made MediaRecorder produce a 53-minute file; seeking is deterministic, and
+   an intro is a few hundred frames, so the cost is irrelevant.
+
+   This app has muxers but no demuxers, and vendoring mp4box.js to decode a
+   five-second sting would be a poor trade. Seeking works for any container
+   Chrome can already play, which is the same set the person is choosing from. */
+const ATT = { intro: null, outro: null };
+
+function bridgeChapters() { try { return bridge().CHAPTERS || []; } catch (e) { return []; } }
+function episodeTotal() { try { return bridge().TOTAL || 0; } catch (e) { return 0; } }
+
+function segs() {
+  const i = ATT.intro ? ATT.intro.dur : 0;
+  const o = ATT.outro ? ATT.outro.dur : 0;
+  const ep = episodeTotal();
+  return { i: i, ep: ep, o: o, grand: i + ep + o };
+}
+
+/* Which piece of the assembled timeline time T falls in, and where inside it. */
+function segAt(T) {
+  const g = segs();
+  if (g.i > 0 && T < g.i) return { kind: 'intro', local: T, att: ATT.intro };
+  if (T < g.i + g.ep) return { kind: 'ep', local: T - g.i };
+  return { kind: 'outro', local: Math.min(Math.max(0, T - g.i - g.ep), g.o), att: ATT.outro };
+}
+
+async function loadAttachment(kind, file) {
+  clearAttachment(kind);
+  const url = URL.createObjectURL(file);
+  const el = document.createElement('video');
+  el.src = url; el.preload = 'auto'; el.playsInline = true; el.muted = false;
+  try {
+    await new Promise((res, rej) => {
+      el.onloadedmetadata = res;
+      el.onerror = () => rej(new Error('the browser cannot read this file'));
+      setTimeout(() => rej(new Error('timed out reading metadata')), 20000);
+    });
+  } catch (e) {
+    URL.revokeObjectURL(url);
+    log(`${kind}: ${e.message}. Use a format Chrome can play — MP4, WebM, MP3, WAV.`, 'err');
+    return false;
+  }
+  if (!isFinite(el.duration) || el.duration <= 0) {
+    URL.revokeObjectURL(url);
+    log(`${kind}: no usable duration in ${file.name}.`, 'err');
+    return false;
+  }
+  const a = { file: file, url: url, el: el, dur: el.duration,
+              hasVideo: el.videoWidth > 0, name: file.name, src: null };
+  /* Route it through the preview gain node so the duck applies here too. */
+  try {
+    const ctx = pvAudioCtx();
+    a.src = ctx.createMediaElementSource(el);
+    a.src.connect(PV.gain);
+  } catch (e) { a.src = null; }
+  ATT[kind] = a;
+  log(`${kind}: ${file.name} — ${fmt(a.dur)} · ${a.hasVideo ? el.videoWidth + '×' + el.videoHeight + ' video' : 'audio only'}`, 'ok');
+  if (!a.hasVideo) log(`  no video track, so the ${kind === 'intro' ? 'first' : 'last'} episode frame is held underneath it.`);
+  return true;
+}
+
+function clearAttachment(kind) {
+  const a = ATT[kind];
+  if (!a) return;
+  try { a.el.pause(); } catch (e) {}
+  if (a.src) { try { a.src.disconnect(); } catch (e) {} }
+  URL.revokeObjectURL(a.url);
+  ATT[kind] = null;
+}
+
+function seekMedia(el, t) {
+  return new Promise((res) => {
+    if (Math.abs(el.currentTime - t) < 1e-4) return res();
+    let done = false;
+    const ok = () => { if (!done) { done = true; el.removeEventListener('seeked', ok); res(); } };
+    el.addEventListener('seeked', ok);
+    /* A seek past the last keyframe can simply never fire. Take the frame we
+       have rather than stalling the whole render on it. */
+    setTimeout(ok, 900);
+    try { el.currentTime = Math.max(0, Math.min(t, (el.duration || 0) - 1e-3)); } catch (e) { ok(); }
+  });
+}
+
+/* Contain-fit onto the brand canvas: an intro shot at a different aspect gets
+   letterboxed in cream rather than stretched. */
+function drawContain(ctx, src, w, h, opacity) {
+  ctx.fillStyle = '#E4DDD0';
+  ctx.fillRect(0, 0, 1920, 1080);
+  if (!w || !h) return;
+  const sc = Math.min(1920 / w, 1080 / h);
+  const dw = w * sc, dh = h * sc;
+  ctx.globalAlpha = opacity;
+  ctx.drawImage(src, (1920 - dw) / 2, (1080 - dh) / 2, dw, dh);
+  ctx.globalAlpha = 1;
+}
+
+/* One frame of the assembled timeline, whichever piece it belongs to. */
+async function drawTimelineFrame(T, ctx, opacity, mode) {
+  const seg = segAt(T);
+  if (seg.kind === 'ep' || !seg.att) {
+    await decodeToCanvas(composeFrame(Math.max(0, Math.min(seg.local, episodeTotal())), opacity, mode), ctx);
+    return;
+  }
+  if (seg.att.hasVideo) {
+    await seekMedia(seg.att.el, seg.local);
+    drawContain(ctx, seg.att.el, seg.att.el.videoWidth, seg.att.el.videoHeight, opacity);
+  } else {
+    /* Audio-only attachment: hold the adjacent episode frame so the screen is
+       never blank under a sting. */
+    const hold = seg.kind === 'intro' ? 0 : episodeTotal();
+    await decodeToCanvas(composeFrame(hold, opacity, mode), ctx);
+  }
+}
+
 /* ----------------------------------------------------------------- render */
 
 async function render() {
   if (S.running) return;
   pvPause(); pvEnable(false);
+  $('bOpen').style.display = 'none';
+  S.outHandle = null; S.outBlob = null;
   S.running = true; S.cancel = false;
   $('bRender').disabled = true; $('bCancel').disabled = false;
   clearLog();
@@ -4592,7 +4854,8 @@ async function render() {
 
   try {
     const B = bridge();
-    const TOTAL = B.TOTAL;
+    const G = segs();
+    const TOTAL = G.grand;
     const CHAPTERS = B.CHAPTERS;
     const fps = +$('fps').value;
     const bitrate = +$('br').value;
@@ -4623,9 +4886,15 @@ async function render() {
     const pick = pickFromProfile(profile, caps);
     if (pick.err) throw new Error(pick.err);
 
-    const env = makeEnvelope(CHAPTERS, TOTAL);
-    const chk = verifyEnvelope(env, fadeVIn, fadeVOut);
+    const env = makeTimelineEnvelope();
+    const chk = (G.i || G.o)
+      ? { ok: false, spliced: true }
+      : verifyEnvelope(env, fadeVIn, fadeVOut);
+    if (G.i || G.o) {
+      log(`Timeline — ${G.i ? 'intro ' + fmt(G.i) + ' + ' : ''}episode ${fmt(G.ep)}${G.o ? ' + outro ' + fmt(G.o) : ''} = ${fmt(G.grand)}`, 'ok');
+    }
     if (chk.ok) log('Fade curve matches the shell exactly', 'ok');
+    else if (chk.spliced) log('Timeline is spliced, so the shell has nothing to compare against. Joins fade exactly like chapter boundaries.');
     else if (chk.asym) log(`Fade is asymmetric — ${chk.why}. The master is the reference for how it looks; the preview only for when it happens.`, 'warn');
     else log(`Fade curve differs from the shell (max ${chk.worst}) — ${chk.why || 'using local curve'}`, 'warn');
     log(`Picture fade in ${fadeVIn}s / out ${fadeVOut}s · audio duck in ${duckIn}s / out ${duckOut}s`);
@@ -4654,11 +4923,13 @@ async function render() {
     let target, fileStream = null;
     if (window.showSaveFilePicker) {
       try {
+        S.outHandle = null; S.outBlob = null;
         const handle = await window.showSaveFilePicker({
           suggestedName: base,
           types: [{ description: pick.ext.toUpperCase() + ' video', accept: { ['video/' + pick.ext]: ['.' + pick.ext] } }],
         });
         fileStream = await handle.createWritable();
+        S.outHandle = handle;
         target = new Muxer.FileSystemWritableFileStreamTarget(fileStream);
         log('Streaming straight to disk — memory stays flat', 'ok');
       } catch (e) {
@@ -4708,8 +4979,20 @@ async function render() {
     /* ---- audio first: cheap, and a failure here should not waste an hour --- */
     if (withAudio) {
       setProg(0, 'Encoding audio…');
-      const audioDur = (typeof B.EPISODE.audioDur === 'number') ? B.EPISODE.audioDur : TOTAL;
-      const track = buildAudio(S.audioBuf, TOTAL, audioDur, env, duckIn, duckOut, +$('vol').value / 100);
+      const sr = S.audioBuf.sampleRate;
+      const epAudioDur = (typeof B.EPISODE.audioDur === 'number') ? B.EPISODE.audioDur : G.ep;
+      const parts = [{ buf: S.audioBuf, at: G.i, tail: (epAudioDur < G.ep) ? G.i + epAudioDur : null }];
+      for (const k of ['intro', 'outro']) {
+        const a = ATT[k]; if (!a) continue;
+        try {
+          const buf = await decodeAudioAt(a.file, sr);
+          parts.push({ buf: buf, at: k === 'intro' ? 0 : G.i + G.ep, tail: null });
+        } catch (e) {
+          log(`${k} carries no decodable audio — its picture is used, silently.`, 'warn');
+        }
+      }
+      parts.sort((x, y) => x.at - y.at);
+      const track = buildAudioParts(parts, TOTAL, env, duckIn, duckOut, +$('vol').value / 100, sr);
       const aenc = new AudioEncoder({
         output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
         error: e => { encErr = e; },
@@ -4752,9 +5035,8 @@ async function render() {
     const opacityAt = t => (fadeVIn > 0 || fadeVOut > 0) ? (0.06 + 0.94 * env(t, fadeVIn, fadeVOut)) : 1;
 
     let s0 = performance.now();
-    let pendSvg = composeFrame(0, opacityAt(0), S.mode);
+    let pending = drawTimelineFrame(0, ctxs[0], opacityAt(0), S.mode);
     composeMs += performance.now() - s0;
-    let pending = decodeToCanvas(pendSvg, ctxs[0]);
     let cur = 0;
 
     let wrote = 0;
@@ -4772,9 +5054,8 @@ async function render() {
       if (f + 1 < totalFrames) {
         const tn = (f + 1) / fps;
         s0 = performance.now();
-        const nsvg = composeFrame(tn, opacityAt(tn), S.mode);
+        nextPending = drawTimelineFrame(tn, ctxs[1 - cur], opacityAt(tn), S.mode);
         composeMs += performance.now() - s0;
-        nextPending = decodeToCanvas(nsvg, ctxs[1 - cur]);
       }
 
       /* The whole point: the timestamp is computed, not observed. A frame that
@@ -4818,11 +5099,13 @@ async function render() {
       log(`${verb} — written to ${base} in ${mins.toFixed(1)} min`, partial ? 'warn' : 'ok');
     } else {
       const blob = new Blob([target.buffer], { type: pick.container === 'mp4' ? 'video/mp4' : 'video/webm' });
+      S.outBlob = blob;
       download(blob, base);
       log(`${verb} — ${(blob.size / 1048576).toFixed(1)} MB in ${mins.toFixed(1)} min`, partial ? 'warn' : 'ok');
     }
     if (partial && withAudio) log('The audio track is full length; the picture stops early. Re-render rather than shipping this.', 'warn');
     if (wrote) logRenderPhases(mins, wrote, composeMs, decodeMs, frameMs, waitMs);
+    if (wrote) showOpen(base);
     setProg(partial ? wrote / totalFrames : 1, partial ? 'Stopped' : 'Done');
   } catch (e) {
     log('FAILED: ' + (e.message || e), 'err');
@@ -4833,6 +5116,38 @@ async function render() {
     $('bRender').disabled = false; $('bCancel').disabled = true;
     if (S.win) pvEnable(true);
   }
+}
+
+/* A web page cannot launch VLC — starting a local application from a browser
+   tab is a security boundary with no workaround, and anything claiming
+   otherwise is a browser extension. What it CAN do is hand the finished file
+   to a new tab, where Chrome's own player handles H.264/AAC and VP9/Opus
+   natively. Reading it back through getFile() gives a File backed by disk, so
+   opening a gigabyte master does not pull a gigabyte into memory.
+
+   For the real thing — VLC, Premiere, YouTube upload — the file is already
+   saved where the picker put it. */
+async function openResult() {
+  try {
+    let url;
+    if (S.outHandle) {
+      const f = await S.outHandle.getFile();
+      url = URL.createObjectURL(f);
+    } else if (S.outBlob) {
+      url = URL.createObjectURL(S.outBlob);
+    } else { log('Nothing to open.', 'warn'); return; }
+    const w = window.open(url, '_blank');
+    if (!w) log('The browser blocked the new tab — allow pop-ups for this page, or open the saved file directly.', 'warn');
+    setTimeout(() => URL.revokeObjectURL(url), 120000);
+  } catch (e) {
+    log('Could not open the file: ' + e.message + '. It is still saved where you chose.', 'warn');
+  }
+}
+
+function showOpen(name) {
+  const b = $('bOpen');
+  b.style.display = '';
+  b.title = 'play ' + name + ' in a new tab';
 }
 
 function download(blob, name) {
@@ -4940,7 +5255,8 @@ ready(() => {
   $('fAudio').onchange = async e => {
     const f = e.target.files[0]; if (!f) return;
     try {
-      S.audioBuf = await decodeAudio(f); S.audioName = f.name;
+      S.audioBuf = await decodeAudio(f); S.audioName = f.name; S.audioFile = f;
+      pvAttachAudio(f);
       log(`Audio ${f.name} — ${fmt(S.audioBuf.duration)} @ ${S.audioBuf.sampleRate}Hz`, 'ok');
       if (S.win) pvBuild();
       try {
@@ -4952,6 +5268,31 @@ ready(() => {
     } catch (err) { log('Could not decode that audio: ' + err.message, 'err'); }
   };
   pvWire();
+  $('bOpen').onclick = openResult;
+  $('pvGoIntro').onclick = () => pvGoto(0);
+  $('pvGoOutro').onclick = () => { const g = segs(); pvGoto(g.i + g.ep); };
+
+  for (const kind of ['intro', 'outro']) {
+    $('f' + kind[0].toUpperCase() + kind.slice(1)).onchange = async e => {
+      const f = e.target.files[0]; if (!f) return;
+      if (await loadAttachment(kind, f)) {
+        const g = segs();
+        log(`Timeline is now ${fmt(g.grand)} — ${g.i ? fmt(g.i) + ' + ' : ''}${fmt(g.ep)}${g.o ? ' + ' + fmt(g.o) : ''}`);
+        if (S.win) pvBuild();
+      }
+    };
+  }
+
+  /* A render is minutes of work that cannot be resumed, and a stray Ctrl+R
+     throws it away silently. The browser shows its own generic wording; all a
+     page can do is ask for the prompt. */
+  window.addEventListener('beforeunload', e => {
+    if (!S.running && !S.win) return;
+    e.preventDefault();
+    e.returnValue = '';
+    return '';
+  });
+
   $('bInspect').onclick = () => inspect().catch(e => log(e.message, 'err'));
   $('bSheets').onclick = sheets;
   $('bRender').onclick = render;
