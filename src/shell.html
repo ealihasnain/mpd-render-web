@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- @mpd-version render-web 5 -->
+<!-- @mpd-version render-web 6 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -94,24 +94,38 @@
 
   .note{font:400 11.5px/1.55 var(--font-body);color:var(--ink-soft);margin-top:10px}
 
+  /* stage + preview canvas */
+  #stagewrap{position:relative}
+  #stage{position:absolute;inset:0}
+  #pvCanvas{position:absolute;inset:0;width:100%;height:100%;display:block;background:#000}
+
   /* transport */
-  #transport{border:1px solid var(--ink);background:var(--canvas-lift);padding:10px 12px}
-  .tp-row{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
-  .btn.pv{padding:7px 12px;font-size:11px;margin:0}
-  .tp-sel{width:auto;min-width:62px;padding:6px 8px;font-family:var(--font-mono);font-size:11px}
-  .tp-vol{display:flex;align-items:center;gap:6px;margin-left:2px}
-  .tp-lab{font-family:var(--font-mono);font-size:9px;letter-spacing:0.12em;color:var(--ink-soft)}
-  .tp-vol input[type=range]{width:88px;accent-color:var(--teal-deep);padding:0;border:0;background:transparent}
-  .tp-time{margin-left:auto;font-family:var(--font-mono);font-size:12px;color:var(--ink)}
-  #pvScrubWrap{margin-top:9px}
+  #transport{border:1px solid var(--ink);background:var(--canvas-lift);padding:9px 10px}
+  .tp-row{display:flex;gap:5px;align-items:center;flex-wrap:nowrap;overflow-x:auto;padding-bottom:2px}
+  .tp-row::-webkit-scrollbar{height:6px}
+  .tp-row::-webkit-scrollbar-thumb{background:var(--canvas-deep)}
+  .btn.pv{padding:6px 10px;font-size:11px;margin:0;flex:none}
+  .btn.pv.ico{font-size:12px;line-height:1;min-width:34px;justify-content:center;padding:7px 8px}
+  /* Native select arrows eat ~18px. Suppressing them is what buys the width
+     reduction without clipping "0.5x" or "30s". */
+  .tp-sel{width:auto;min-width:0;flex:none;padding:6px 13px 6px 5px;font-family:var(--font-mono);
+    font-size:11px;appearance:none;-webkit-appearance:none;background-repeat:no-repeat;
+    background-position:right 4px center;background-size:6px;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 5'><path d='M0 0h8L4 5z' fill='%232A2520'/></svg>")}
+  #pvJump{width:44px}
+  #pvSpeed{width:46px}
+  #pvVol{width:70px;flex:none;accent-color:var(--teal-deep);padding:0;border:0;background:transparent}
+  .tp-div{width:1px;height:22px;background:var(--hairline);flex:none;margin:0 3px}
+  #pvChaps{display:flex;gap:4px;flex:none}
+  .tp-time{margin-left:auto;padding-left:10px;font-family:var(--font-mono);font-size:12px;color:var(--ink);white-space:nowrap;flex:none}
+  #pvScrubWrap{margin-top:8px}
   #pvScrub{height:12px;background:var(--canvas-deep);border:1px solid var(--ink);cursor:pointer;position:relative}
   #pvScrubFill{height:100%;width:0;background:var(--teal);pointer-events:none}
-  #pvChaps{display:flex;gap:5px;flex-wrap:wrap;margin-top:9px}
-  .chbtn{font-family:var(--font-mono);font-size:10px;letter-spacing:0.06em;padding:5px 9px;
+  .chbtn{font-family:var(--font-mono);font-size:10px;letter-spacing:0.04em;padding:5px 8px;flex:none;
          border:1px solid var(--ink);background:var(--canvas);color:var(--ink);cursor:pointer}
   .chbtn:hover{background:var(--ink);color:var(--canvas)}
   .chbtn.on{background:var(--teal-deep);border-color:var(--teal-deep);color:var(--canvas)}
-  .tp-hint{font:400 11px/1.5 var(--font-body);color:var(--ink-soft);margin-top:8px}
+  .tp-hint{font:400 11px/1.5 var(--font-body);color:var(--ink-soft);margin-top:7px}
 </style>
 </head>
 <body>
@@ -185,20 +199,20 @@
     <button class="btn" id="bInspect" disabled>Inspect</button>
     <button class="btn warn" id="bSheets" disabled>Contact sheets</button>
     <button class="btn primary" id="bRender" disabled>Render master</button>
-    <button class="btn" id="bCancel" disabled>Cancel</button>
+    <button class="btn warn" id="bCancel" disabled>■ Stop render</button>
     <div class="note">Chrome asks where to save before rendering starts, then
       writes as it goes. Keep the tab focused — a background tab is throttled.</div>
   </div>
 
   <div id="right">
-    <div id="stagewrap"><iframe id="stage"></iframe></div>
+    <div id="stagewrap"><iframe id="stage"></iframe><canvas id="pvCanvas" width="1920" height="1080"></canvas></div>
 
     <div id="transport">
       <div class="tp-row">
-        <button class="btn pv" id="pvPlay" disabled>▶ Play</button>
-        <button class="btn pv" id="pvStop" disabled>■ Stop</button>
-        <button class="btn pv" id="pvBack" disabled>◀◀</button>
-        <button class="btn pv" id="pvFwd" disabled>▶▶</button>
+        <button class="btn pv ico" id="pvPlay" disabled title="play / pause (space)">&#9654;</button>
+        <button class="btn pv ico" id="pvStop" disabled title="stop">&#9632;</button>
+        <button class="btn pv ico" id="pvBack" disabled title="skip back (left arrow)">&#9664;&#9664;</button>
+        <button class="btn pv ico" id="pvFwd" disabled title="skip forward (right arrow)">&#9654;&#9654;</button>
         <select id="pvJump" class="tp-sel" title="skip amount">
           <option value="2">2s</option><option value="3">3s</option>
           <option value="5" selected>5s</option><option value="10">10s</option>
@@ -206,18 +220,16 @@
           <option value="30">30s</option>
         </select>
         <select id="pvSpeed" class="tp-sel" title="playback speed">
-          <option value="0.5">0.5×</option><option value="1" selected>1×</option>
-          <option value="2">2×</option><option value="4">4×</option><option value="8">8×</option>
+          <option value="0.5">0.5&times;</option><option value="1" selected>1&times;</option>
+          <option value="2">2&times;</option><option value="4">4&times;</option><option value="8">8&times;</option>
         </select>
-        <span class="tp-vol">
-          <span class="tp-lab">VOL</span>
-          <input type="range" id="pvVol" min="0" max="100" value="100">
-        </span>
+        <input type="range" id="pvVol" min="0" max="100" value="100" title="volume">
+        <span class="tp-div"></span>
+        <span id="pvChaps"></span>
         <span class="tp-time" id="pvTime">0:00 / 0:00</span>
       </div>
       <div id="pvScrubWrap"><div id="pvScrub"><div id="pvScrubFill"></div></div></div>
-      <div id="pvChaps"></div>
-      <div class="tp-hint" id="pvHint">Load an episode to preview. Space plays, ← → skip, ↑ ↓ change chapter.</div>
+      <div class="tp-hint" id="pvHint">Load an episode to preview. Space plays, &larr; &rarr; skip, &uarr; &darr; change chapter.</div>
     </div>
 
     <div>

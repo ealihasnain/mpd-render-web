@@ -1,4 +1,4 @@
-# mpd-render-web 5
+# mpd-render-web 6
 
 Deterministic master render for MoneyPatternsDecoded video shells. Runs entirely
 in the browser — no Python, no admin rights, no install, nothing uploaded.
@@ -77,6 +77,40 @@ Rather than guess a third time, version 4 measures the loop that does the work:
   so frame *n+1* decodes while frame *n* is encoded. The snapshot is a string,
   so painting *n+1* cannot disturb a decode already in flight.
 - **Elapsed time and projected finish clock** alongside time remaining.
+
+### The preview shows the output, not the shell
+
+Version 5's transport drove the shell's live DOM and set `#live.style.opacity`
+directly. It worked against a fixture and came out blank against a real
+episode — and it was blank in a way rendering would never have revealed,
+because the render path serialises the DOM to a string and never looks at the
+iframe at all. A preview whose failure modes are disjoint from the output's is
+not a preview of anything.
+
+Version 6 draws the preview with `composeFrame()` + `decodeToCanvas()`, the same
+pair the render loop uses, onto a canvas over the stage. Measured: zero pixels
+differ between a previewed frame and the frame the renderer writes for the same
+timestamp. Consequences worth knowing:
+
+- The fade blends toward canvas cream, because that is what the master does.
+  The shell's own preview dips to dark. The master was always right; only the
+  preview disagreed.
+- Rasterising costs tens of milliseconds, so at 8x the picture drops frames.
+  The audio clock is never held back for it, so sync stays true and only
+  smoothness suffers.
+
+### Stopping a render
+
+**Stop render** breaks the frame loop rather than throwing, so the muxer is
+still finalised and the encoder still flushed. The file on disk is a shorter
+valid video, not a truncated one — verified by cancelling at frame 47 of 90 and
+probing the result: 47 packets, `avg_frame_rate 30/1`, plays. Nine minutes into
+a render, a playable first half is worth considerably more than nothing. The
+log says how many frames were written, and warns that the audio track is full
+length while the picture stops early.
+
+Stop is also checked inside the encoder-queue wait, so it takes effect
+immediately rather than after the queue drains.
 
 ### Preview transport
 

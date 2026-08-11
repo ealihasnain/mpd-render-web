@@ -1,4 +1,4 @@
-/* @mpd-version render-web 5
+/* @mpd-version render-web 6
    mpd-render-web — deterministic browser render for MPD video shells.
 
    The shell's export loop was already deterministic: it paints from a frame
@@ -41,7 +41,7 @@ function log(msg, cls) {
 }
 function clearLog() { $('log').innerHTML = ''; }
 function setProg(frac, text) {
-  $('pfill').style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
+  if (frac !== undefined) $('pfill').style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
   if (text !== undefined) $('ptext').textContent = text;
 }
 /* Wall-clock finish time. On a fifteen-minute render "done ~14:52" is easier
@@ -720,6 +720,7 @@ const PV = {
   t: 0, playing: false, speed: 1, vol: 1,
   ctx: null, src: null, gain: null, raf: null,
   anchorT: 0, anchorCtx: 0, anchorWall: 0,
+  cx: null, busy: false, painted: 0, drops: 0, shown: 0,
 };
 
 function pvTotal() { try { return bridge().TOTAL; } catch (e) { return 0; } }
@@ -826,21 +827,45 @@ function pvSetVol() {
   PV.vol = (+$('pvVol').value) / 100;
 }
 
-/* Picture opacity and audio gain both come from the same envelope, so what the
-   preview shows and what the master writes cannot disagree. */
-function pvPaint() {
-  if (!S.win || typeof S.win.paint !== 'function') return;
-  const f = pvFades();
-  S.win.paint(PV.t);
-  const op = (f.vIn > 0 || f.vOut > 0) ? (0.06 + 0.94 * pvEnv()(PV.t, f.vIn, f.vOut)) : 1;
-  if (S.live) S.live.style.opacity = op;
-  if (PV.gain) {
-    let g = (f.aIn > 0 || f.aOut > 0) ? pvEnv()(PV.t, f.aIn, f.aOut) : 1;
-    const dur = S.audioBuf ? S.audioBuf.duration : 0;
-    if (f.aOut > 0 && dur && dur - PV.t < f.aOut) g = Math.min(g, Math.max(0, (dur - PV.t) / f.aOut));
-    PV.gain.gain.value = g * PV.vol;
-  }
+/* Draws the frame the RENDER would write, not the shell's live DOM.
+
+   The first version drove the iframe and set `#live.style.opacity` directly.
+   That looked correct against a fixture and came out blank against the real
+   shell — and it was blank in a way no amount of rendering would ever have
+   surfaced, because the render path serialises the DOM to a string and never
+   looks at the iframe at all. A preview whose failure modes are disjoint from
+   the output's is not a preview of anything.
+
+   So this runs composeFrame() + decodeToCanvas(), the exact pair the render
+   loop uses and already proven pixel-identical to the shell's own rasteriser,
+   and paints onto a canvas over the stage. What appears here is what lands in
+   the file — including the fade blending toward canvas cream rather than the
+   dark dip the shell's own preview shows. */
+async function pvDraw() {
+  if (!S.win || !PV.cx || PV.busy) { PV.drops++; return; }
+  PV.busy = true;
+  try {
+    const f = pvFades();
+    const op = (f.vIn > 0 || f.vOut > 0) ? (0.06 + 0.94 * pvEnv()(PV.t, f.vIn, f.vOut)) : 1;
+    const svg = composeFrame(PV.t, op, S.mode);
+    await decodeToCanvas(svg, PV.cx);
+    PV.painted = PV.t; PV.shown++;
+  } catch (e) {
+    /* One bad frame should not take playback down with it. */
+  } finally { PV.busy = false; }
 }
+
+/* Gain is cheap and must never wait on a raster. */
+function pvGain() {
+  if (!PV.gain) return;
+  const f = pvFades();
+  let g = (f.aIn > 0 || f.aOut > 0) ? pvEnv()(PV.t, f.aIn, f.aOut) : 1;
+  const dur = S.audioBuf ? S.audioBuf.duration : 0;
+  if (f.aOut > 0 && dur && dur - PV.t < f.aOut) g = Math.min(g, Math.max(0, (dur - PV.t) / f.aOut));
+  PV.gain.gain.value = g * PV.vol;
+}
+
+function pvPaint() { pvGain(); pvDraw(); }
 
 function pvTick() {
   if (!PV.playing) return;
@@ -858,6 +883,10 @@ function pvTick() {
   if (PV.src && S.audioBuf && PV.t >= S.audioBuf.duration - 0.05) {
     pvStopAudio(); PV.anchorWall = performance.now();
   }
+  /* Rasterising costs tens of milliseconds, so at 8x — or on a heavy beat —
+     the picture cannot keep up. Dropping frames is the correct trade: the audio
+     clock is never held back for the renderer, so sync stays true and only
+     smoothness suffers. */
   pvPaint();
   pvSyncUI();
   PV.raf = requestAnimationFrame(pvTick);
@@ -865,7 +894,7 @@ function pvTick() {
 
 function pvSyncUI() {
   const total = pvTotal();
-  $('pvPlay').textContent = PV.playing ? '❚❚ Pause' : '▶ Play';
+  $('pvPlay').innerHTML = PV.playing ? '&#10074;&#10074;' : '&#9654;';
   $('pvTime').textContent = fmt(PV.t) + ' / ' + fmt(total);
   $('pvScrubFill').style.width = (total ? PV.t / total * 100 : 0) + '%';
   const ch = pvChapters();
@@ -882,7 +911,8 @@ function pvEnable(on) {
 
 function pvBuild() {
   PV._env = null;
-  PV.t = 0; PV.playing = false;
+  PV.t = 0; PV.playing = false; PV.drops = 0; PV.shown = 0;
+  if (!PV.cx) PV.cx = $('pvCanvas').getContext('2d', { alpha: false });
   const wrap = $('pvChaps');
   wrap.innerHTML = '';
   pvChapters().forEach((c, i) => {
@@ -1104,8 +1134,13 @@ async function render() {
     let pending = decodeToCanvas(pendSvg, ctxs[0]);
     let cur = 0;
 
+    let wrote = 0;
     for (let f = 0; f < totalFrames; f++) {
-      if (S.cancel) throw new Error('cancelled');
+      /* Cancelling breaks rather than throws, so the muxer is still finalised
+         and the file on disk is a shorter valid video instead of a truncated
+         one. Nine minutes into a render, a playable first half is worth
+         considerably more than nothing. */
+      if (S.cancel) { log(`Cancelled at frame ${f} of ${totalFrames} — finalising what is written.`, 'warn'); break; }
       if (encErr) throw encErr;
 
       s0 = performance.now(); await pending; decodeMs += performance.now() - s0;
@@ -1132,10 +1167,10 @@ async function render() {
 
       if (venc.encodeQueueSize > QUEUE_HIGH) {
         const w0 = performance.now();
-        while (venc.encodeQueueSize > QUEUE_LOW) await new Promise(r => setTimeout(r, 2));
+        while (venc.encodeQueueSize > QUEUE_LOW && !S.cancel) await new Promise(r => setTimeout(r, 2));
         waitMs += performance.now() - w0;
       }
-      pending = nextPending; cur = 1 - cur;
+      pending = nextPending; cur = 1 - cur; wrote = f + 1;
 
       if (f % 10 === 0 || f === totalFrames - 1) {
         const el = (performance.now() - started) / 1000;
@@ -1153,17 +1188,19 @@ async function render() {
     muxer.finalize();
 
     const mins = (performance.now() - started) / 60000;
+    const partial = wrote < totalFrames;
+    const verb = partial ? `Stopped — ${wrote} of ${totalFrames} frames (${fmt(wrote / fps)})` : 'Done';
     if (fileStream) {
       await fileStream.close();
-      log(`Done — written to ${base} in ${mins.toFixed(1)} min`, 'ok');
-      logRenderPhases(mins, totalFrames, composeMs, decodeMs, frameMs, waitMs);
+      log(`${verb} — written to ${base} in ${mins.toFixed(1)} min`, partial ? 'warn' : 'ok');
     } else {
       const blob = new Blob([target.buffer], { type: pick.container === 'mp4' ? 'video/mp4' : 'video/webm' });
       download(blob, base);
-      log(`Done — ${(blob.size / 1048576).toFixed(1)} MB in ${mins.toFixed(1)} min`, 'ok');
-      logRenderPhases(mins, totalFrames, composeMs, decodeMs, frameMs, waitMs);
+      log(`${verb} — ${(blob.size / 1048576).toFixed(1)} MB in ${mins.toFixed(1)} min`, partial ? 'warn' : 'ok');
     }
-    setProg(1, 'Done');
+    if (partial && withAudio) log('The audio track is full length; the picture stops early. Re-render rather than shipping this.', 'warn');
+    if (wrote) logRenderPhases(mins, wrote, composeMs, decodeMs, frameMs, waitMs);
+    setProg(partial ? wrote / totalFrames : 1, partial ? 'Stopped' : 'Done');
   } catch (e) {
     log('FAILED: ' + (e.message || e), 'err');
     setProg(0, 'Failed');
@@ -1295,7 +1332,12 @@ ready(() => {
   $('bInspect').onclick = () => inspect().catch(e => log(e.message, 'err'));
   $('bSheets').onclick = sheets;
   $('bRender').onclick = render;
-  $('bCancel').onclick = () => { S.cancel = true; log('Cancelling…', 'warn'); };
+  $('bCancel').onclick = () => {
+    if (!S.running) return;
+    S.cancel = true;
+    log('Stopping — the frames already encoded will be finalised into a playable file.', 'warn');
+    setProg(undefined, 'Stopping…');
+  };
 
   if (typeof VideoEncoder === 'undefined') {
     log('This browser has no WebCodecs. Use desktop Chrome or Edge.', 'err');
