@@ -1,4 +1,4 @@
-# mpd-render-web
+# mpd-render-web 2
 
 Deterministic master render for MoneyPatternsDecoded video shells. Runs entirely
 in the browser — no Python, no admin rights, no install, nothing uploaded.
@@ -103,16 +103,46 @@ driven from one curve.
 
 ## Performance
 
-Measured on a real 7-chapter assembly: ~28ms per frame, of which serialisation
-is 2ms and SVG decode is the rest. Inlining the 156 KB of base64 fonts roughly
-doubles decode cost (36ms vs 18ms without), but an SVG loaded as an image cannot
-fetch anything — drop the fonts and every glyph falls back to a serif. All six
-faces are genuinely used, so there is no subsetting win available.
+The shell's `serializeFrame()` writes every mounted beat into every frame,
+hidden or not, plus all 156 KB of base64 fonts. On a 115-beat episode that is
+304 KB of markup per frame. This app instead serialises only the groups that
+are visible at time *t*, and only the font faces that frame's markup actually
+names — typically one of six.
+
+Measured on a 115-beat assembly:
+
+| path | per frame |
+|---|---|
+| shell `serializeFrame()` | 83 ms |
+| visible groups only | 36 ms |
+| visible groups + font subset | **19 ms** |
+
+4.4x, and **pixel-identical** — 0 differing pixels, max channel difference 0.
+
+That claim is re-proven at runtime, not trusted. Before every render the app
+renders sample frames both ways and compares them pixel by pixel. Any
+disagreement and it falls back to the shell's own path for the whole run and
+says so in the log. A silent serif fallback would cost far more than the time
+it saves.
 
 `createImageBitmap()` cannot decode SVG blobs in Chromium; `Image` + object URL
 is the only working path.
 
-Heavier episodes cost more per frame. **Inspect** measures yours.
+## Memory
+
+A 9-minute 1080p master is over a gigabyte. Buffered in an ArrayBuffer that
+gets the tab suspended by Chrome mid-render. So the output streams to disk
+through the File System Access API: Chrome asks where to save *before*
+rendering starts and writes as it goes, keeping memory flat.
+
+The MP4 moov atom therefore lands at the end of the file rather than the front.
+Fine for a YouTube master and for local playback; it only matters for
+progressive streaming off a web server.
+
+Without the File System Access API the app falls back to buffering in RAM and
+warns. Chrome and Edge have it; that is the same requirement as the encoders.
+
+A screen wake lock is held during the render.
 
 ## Build
 

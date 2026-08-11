@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- @mpd-version render-web 1 -->
+<!-- @mpd-version render-web 2 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -53,7 +53,7 @@
 
 <header>
   <h1>mpd-render-web</h1>
-  <div class="sub">deterministic master render · WebCodecs · no upload, nothing leaves this machine</div>
+  <div class="sub">deterministic master render · WebCodecs · streams to disk · nothing leaves this machine</div>
 </header>
 
 <main>
@@ -83,8 +83,8 @@
       <div class="two" style="margin-top:9px">
         <div><label>Bitrate</label>
           <select id="br">
-            <option value="12000000">12 Mbps</option>
-            <option value="16000000" selected>16 Mbps</option>
+            <option value="12000000" selected>12 Mbps</option>
+            <option value="16000000">16 Mbps</option>
             <option value="24000000">24 Mbps</option>
           </select></div>
         <div><label>Volume %</label><input type="number" id="vol" min="0" max="100" value="100"></div>
@@ -107,8 +107,8 @@
     <button class="btn warn" id="bSheets" disabled>Contact sheets</button>
     <button class="btn pri" id="bRender" disabled>Render master</button>
     <button class="btn" id="bCancel" disabled>Cancel</button>
-    <div class="note">Keep this tab focused and the machine awake. A background
-      tab is throttled and the render will crawl.</div>
+    <div class="note">Chrome asks where to save before rendering starts, then
+      writes as it goes. Keep the tab focused — a background tab is throttled.</div>
   </div>
 
   <div id="right">
@@ -3502,7 +3502,7 @@ ${notes}`;
 })();
 if (typeof module === "object" && typeof module.exports === "object") Object.assign(module.exports, WebMMuxer)
 </script>
-<script>/* @mpd-version render-web 1
+<script>/* @mpd-version render-web 2
    mpd-render-web — deterministic browser render for MPD video shells.
 
    The shell's export loop was already deterministic: it paints from a frame
@@ -3516,7 +3516,7 @@ const $ = id => document.getElementById(id);
 const S = {
   win: null, doc: null, live: null, html: null,
   audioBuf: null, audioName: '', htmlName: '',
-  cancel: false, running: false,
+  cancel: false, running: false, fontCss: '', faces: null, mode: 'fast', wake: null,
 };
 
 function log(msg, cls) {
@@ -3610,6 +3610,9 @@ async function loadEpisode(file) {
     return false;
   }
   S.live = S.doc.getElementById('live');
+  const fontEl = S.doc.getElementById('mpd-fonts');
+  S.fontCss = fontEl ? fontEl.textContent : '';
+  S.faces = S.fontCss ? parseFaces(S.fontCss) : null;
   log(`Ready in ${((performance.now() - t0) / 1000).toFixed(1)}s`, 'ok');
   URL.revokeObjectURL(url);
   return true;
@@ -3685,10 +3688,17 @@ async function inspect() {
   if (pick.err) log(pick.err, 'err');
   else log(`Would write .${pick.ext} (${pick.vshort} + ${pick.audioOk ? pick.ashort : 'no audio codec'})`, 'ok');
 
-  const ms = await benchRaster(8);
+  const par = await runParity(4);
   const fps = +$('fps').value;
   const frames = Math.round(B.TOTAL * fps);
-  log(`Raster ${ms.toFixed(0)}ms/frame → ${frames} frames ≈ ${fmt(frames * ms / 1000)} to render`);
+  if (par.ok) {
+    log(`Fast rasteriser verified pixel-identical (${par.fastMs.toFixed(0)}ms vs ${par.shellMs.toFixed(0)}ms shell)`, 'ok');
+    log(`${frames} frames ≈ ${fmt(frames * par.fastMs / 1000)} to render`);
+  } else {
+    log(`Fast rasteriser differs (max ${par.worst}, ${par.ndiff}px) — will use the shell path`, 'warn');
+    log(`${frames} frames ≈ ${fmt(frames * par.shellMs / 1000)} to render`);
+  }
+  if (!window.showSaveFilePicker) log('No File System Access API — output must buffer in RAM. Use Chrome or Edge.', 'warn');
   setProg(0, 'Inspect done');
 }
 
@@ -3697,20 +3707,64 @@ async function benchRaster(n) {
   const cv = document.createElement('canvas'); cv.width = 1920; cv.height = 1080;
   const cx = cv.getContext('2d', { alpha: false });
   const t0 = performance.now();
-  for (let i = 0; i < n; i++) await rasterAt(B.TOTAL * (i + 0.5) / n, cx, 1);
+  for (let i = 0; i < n; i++) await rasterAt(B.TOTAL * (i + 0.5) / n, cx, 1, S.mode);
   return (performance.now() - t0) / n;
 }
 
 /* ------------------------------------------------------------ rasterising */
 
-/* Uses the shell's own serializeFrame(), so the pixels are the ones the shell
-   would have produced. Fonts are inlined into every frame, which roughly
-   doubles decode cost, but an SVG loaded as an image cannot fetch anything and
-   without them every glyph falls back to a serif. */
-function rasterAt(t, ctx, opacity) {
-  S.win.paint(t);
-  S.live.style.opacity = opacity;
-  const svg = S.win.serializeFrame();
+/* The shell's serializeFrame() writes out every mounted beat, hidden or not,
+   plus all 156KB of base64 fonts. On a 115-beat episode that is 304KB of
+   markup per frame and ~110ms to decode. Serialising only the visible groups
+   and only the font faces the frame actually references cuts both. Measured
+   3x faster and pixel-identical, but "measured" is not "assumed" -- runParity()
+   proves it against the shell's own output before either mode is trusted. */
+
+function parseFaces(cssText) {
+  return cssText.split('@font-face').filter(x => x.trim()).map(chunk => {
+    const block = '@font-face' + chunk;
+    const fam = (block.match(/font-family:\s*["']?([^"';}]+)/) || [])[1];
+    return { css: block, family: (fam || '').trim().toLowerCase() };
+  });
+}
+
+/* Only faces whose family the markup names. Weights are not filtered: a design
+   writing font-weight:bold rather than 700 would lose its face and fall back to
+   a serif, and all weights of one family is still a large cut. */
+function subsetFonts(markup, faces) {
+  const named = new Set();
+  const re = /font-family\s*[:=]\s*["']?([^"';,)>]+)/gi;
+  let m;
+  while ((m = re.exec(markup)) !== null) named.add(m[1].trim().toLowerCase());
+  if (!named.size) return null;
+  const keep = faces.filter(f => named.has(f.family));
+  return keep.length ? keep.map(f => f.css).join('') : null;
+}
+
+function buildFrameSVG(opacity) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const live = S.live;
+  const doc = S.doc;
+  const out = doc.createElementNS(NS, 'svg');
+  out.setAttribute('xmlns', NS);
+  out.setAttribute('viewBox', live.getAttribute('viewBox') || '0 0 1920 1080');
+  out.setAttribute('preserveAspectRatio', live.getAttribute('preserveAspectRatio') || 'xMidYMid meet');
+  out.setAttribute('width', 1920);
+  out.setAttribute('height', 1080);
+  if (opacity !== 1) out.setAttribute('style', 'opacity:' + opacity);
+
+  for (const g of live.children) {
+    if (g.tagName === 'style') continue;
+    if (g.style && g.style.display === 'none') continue;
+    out.appendChild(g.cloneNode(true));
+  }
+  let body = new XMLSerializer().serializeToString(out);
+  const css = (S.faces && subsetFonts(body, S.faces)) || S.fontCss;
+  const style = '<style>' + css + '</style>';
+  return body.replace('>', '>' + style);
+}
+
+function decodeToCanvas(svg, ctx) {
   return new Promise((res, rej) => {
     const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }));
     const img = new Image();
@@ -3721,9 +3775,47 @@ function rasterAt(t, ctx, opacity) {
       URL.revokeObjectURL(url);
       res();
     };
-    img.onerror = () => { URL.revokeObjectURL(url); rej(new Error(`frame decode failed at t=${t.toFixed(2)}s`)); };
+    img.onerror = () => { URL.revokeObjectURL(url); rej(new Error('frame decode failed')); };
     img.src = url;
   });
+}
+
+/* mode 'fast' = visible groups + subset fonts. mode 'shell' = the shell's own
+   serializeFrame(), byte for byte what its EXPORT button would have produced. */
+async function rasterAt(t, ctx, opacity, mode) {
+  S.win.paint(t);
+  if (mode === 'shell') {
+    S.live.style.opacity = opacity;
+    await decodeToCanvas(S.win.serializeFrame(), ctx);
+  } else {
+    S.live.style.opacity = 1;
+    await decodeToCanvas(buildFrameSVG(opacity), ctx);
+  }
+}
+
+/* Compare the fast path against the shell's own output on sample frames. Any
+   disagreement and the fast path is abandoned for the whole run -- a silent
+   serif fallback would be far more expensive than the time it saves. */
+async function runParity(samples) {
+  const total = bridge().TOTAL;
+  const a = document.createElement('canvas'); a.width = 1920; a.height = 1080;
+  const b = document.createElement('canvas'); b.width = 1920; b.height = 1080;
+  const ax = a.getContext('2d', { alpha: false }), bx = b.getContext('2d', { alpha: false });
+  let worst = 0, ndiff = 0, tShell = 0, tFast = 0;
+  for (let i = 0; i < samples; i++) {
+    const t = total * (i + 0.5) / samples;
+    let s = performance.now(); await rasterAt(t, ax, 1, 'shell'); tShell += performance.now() - s;
+    s = performance.now(); await rasterAt(t, bx, 1, 'fast'); tFast += performance.now() - s;
+    const A = ax.getImageData(0, 0, 1920, 1080).data;
+    const B = bx.getImageData(0, 0, 1920, 1080).data;
+    for (let k = 0; k < A.length; k += 4) {
+      const d = Math.max(Math.abs(A[k] - B[k]), Math.abs(A[k + 1] - B[k + 1]), Math.abs(A[k + 2] - B[k + 2]));
+      if (d > worst) worst = d;
+      if (d > 2) ndiff++;
+    }
+  }
+  return { ok: worst === 0, worst, ndiff,
+           shellMs: tShell / samples, fastMs: tFast / samples };
 }
 
 /* The shell's own curve, reimplemented here because calling across the frame
@@ -3827,13 +3919,49 @@ async function render() {
     const totalFrames = Math.round(TOTAL * fps);
     log(`Writing .${pick.ext} · ${pick.vshort}${withAudio ? ' + ' + pick.ashort : ''} · ${totalFrames} frames @ ${fps}fps · ${(bitrate / 1e6).toFixed(0)} Mbps`);
 
+    /* Verify the fast rasteriser before spending the run on it. */
+    setProg(0, 'Checking rasteriser…');
+    const par = await runParity(3);
+    S.mode = par.ok ? 'fast' : 'shell';
+    if (par.ok) log(`Fast rasteriser verified pixel-identical — ${par.fastMs.toFixed(0)}ms/frame (shell path ${par.shellMs.toFixed(0)}ms)`, 'ok');
+    else log(`Fast rasteriser differs (max channel ${par.worst}) — falling back to the shell path`, 'warn');
+    const estMs = par.ok ? par.fastMs : par.shellMs;
+    log(`Estimated ${fmt(totalFrames * estMs / 1000)} of rendering`);
+
+    /* An hour of 1080p at 16 Mbps is over a gigabyte. Held in an
+       ArrayBuffer that gets the tab killed, so stream it to disk. */
+    const base = (B.EPISODE.id || 'EP') + '_Master.' + pick.ext;
     const Muxer = pick.container === 'mp4' ? Mp4Muxer : WebMMuxer;
-    const target = new Muxer.ArrayBufferTarget();
+    let target, fileStream = null;
+    if (window.showSaveFilePicker) {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: base,
+          types: [{ description: pick.ext.toUpperCase() + ' video', accept: { ['video/' + pick.ext]: ['.' + pick.ext] } }],
+        });
+        fileStream = await handle.createWritable();
+        target = new Muxer.FileSystemWritableFileStreamTarget(fileStream);
+        log('Streaming straight to disk — memory stays flat', 'ok');
+      } catch (e) {
+        if (e && e.name === 'AbortError') { log('Save cancelled — nothing rendered.', 'warn'); setProg(0, 'Cancelled'); return; }
+        log('Could not open a file for writing (' + e.message + ') — buffering in RAM instead.', 'warn');
+        target = new Muxer.ArrayBufferTarget();
+      }
+    }
+    if (!target) {
+      target = new Muxer.ArrayBufferTarget();
+      log('No File System Access API — buffering in RAM. Long episodes may exhaust the tab.', 'warn');
+    }
+
+    try { if (navigator.wakeLock) S.wake = await navigator.wakeLock.request('screen'); } catch (e) {}
+
     const muxCfg = {
       target,
       video: { codec: pick.container === 'mp4' ? 'avc' : 'V_VP9', width: 1920, height: 1080, frameRate: fps },
     };
-    if (pick.container === 'mp4') muxCfg.fastStart = 'in-memory';
+    /* moov goes at the end when streaming: an in-memory fast start would
+       defeat the point. Fine for a YouTube master and for local playback. */
+    if (pick.container === 'mp4') muxCfg.fastStart = fileStream ? false : 'in-memory';
     if (withAudio) {
       muxCfg.audio = {
         codec: pick.container === 'mp4' ? 'aac' : 'A_OPUS',
@@ -3899,7 +4027,7 @@ async function render() {
       if (encErr) throw encErr;
       const t = f / fps;
       const op = fadeV > 0 ? (0.06 + 0.94 * env(t, fadeV)) : 1;
-      await rasterAt(t, cx, op);
+      await rasterAt(t, cx, op, S.mode);
 
       /* The whole point: the timestamp is computed, not observed. A frame that
          took 800ms to draw is still stamped at exactly f/fps. */
@@ -3927,17 +4055,22 @@ async function render() {
     if (encErr) throw encErr;
     muxer.finalize();
 
-    const blob = new Blob([target.buffer], { type: pick.container === 'mp4' ? 'video/mp4' : 'video/webm' });
-    const base = (B.EPISODE.id || 'EP') + '_Master';
-    download(blob, `${base}.${pick.ext}`);
     const mins = (performance.now() - started) / 60000;
-    log(`Done — ${(blob.size / 1048576).toFixed(1)} MB in ${mins.toFixed(1)} min`, 'ok');
+    if (fileStream) {
+      await fileStream.close();
+      log(`Done — written to ${base} in ${mins.toFixed(1)} min`, 'ok');
+    } else {
+      const blob = new Blob([target.buffer], { type: pick.container === 'mp4' ? 'video/mp4' : 'video/webm' });
+      download(blob, base);
+      log(`Done — ${(blob.size / 1048576).toFixed(1)} MB in ${mins.toFixed(1)} min`, 'ok');
+    }
     setProg(1, 'Done');
   } catch (e) {
     log('FAILED: ' + (e.message || e), 'err');
     setProg(0, 'Failed');
   } finally {
     S.running = false;
+    try { if (S.wake) { await S.wake.release(); S.wake = null; } } catch (e) {}
     $('bRender').disabled = false; $('bCancel').disabled = true;
   }
 }
@@ -3994,7 +4127,7 @@ async function sheets() {
         if (S.cancel) throw new Error('cancelled');
         const b = list[n];
         const t = b.t + b.dur * at;
-        await rasterAt(t, cx, 1);
+        await rasterAt(t, cx, 1, S.mode);
         const r = Math.floor(n / cols), c = n % cols;
         sx.drawImage(cv, 8 + c * (CW + 8), 8 + r * (CH_ + 8), CW, CH_);
         index.push(`ch${ch} r${r + 1}c${c + 1}  ${b.design}  t=${b.t.toFixed(2)}s dur=${b.dur.toFixed(2)}s shot@${t.toFixed(2)}s`);

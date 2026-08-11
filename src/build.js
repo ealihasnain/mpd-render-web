@@ -1,4 +1,4 @@
-/* @mpd-version render-web 1
+/* @mpd-version render-web 2
    Bundles src/ into the single-file index.html at the repo root.
    Run from anywhere: node src/build.js */
 const fs = require('fs');

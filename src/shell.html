@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- @mpd-version render-web 1 -->
+<!-- @mpd-version render-web 2 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -53,7 +53,7 @@
 
 <header>
   <h1>mpd-render-web</h1>
-  <div class="sub">deterministic master render · WebCodecs · no upload, nothing leaves this machine</div>
+  <div class="sub">deterministic master render · WebCodecs · streams to disk · nothing leaves this machine</div>
 </header>
 
 <main>
@@ -83,8 +83,8 @@
       <div class="two" style="margin-top:9px">
         <div><label>Bitrate</label>
           <select id="br">
-            <option value="12000000">12 Mbps</option>
-            <option value="16000000" selected>16 Mbps</option>
+            <option value="12000000" selected>12 Mbps</option>
+            <option value="16000000">16 Mbps</option>
             <option value="24000000">24 Mbps</option>
           </select></div>
         <div><label>Volume %</label><input type="number" id="vol" min="0" max="100" value="100"></div>
@@ -107,8 +107,8 @@
     <button class="btn warn" id="bSheets" disabled>Contact sheets</button>
     <button class="btn pri" id="bRender" disabled>Render master</button>
     <button class="btn" id="bCancel" disabled>Cancel</button>
-    <div class="note">Keep this tab focused and the machine awake. A background
-      tab is throttled and the render will crawl.</div>
+    <div class="note">Chrome asks where to save before rendering starts, then
+      writes as it goes. Keep the tab focused — a background tab is throttled.</div>
   </div>
 
   <div id="right">
